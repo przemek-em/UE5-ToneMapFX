@@ -75,12 +75,12 @@ Smooth feathering between adjacent ranges prevents hard color boundaries.
 ### Bloom
 Four bloom styles:
 
-| | Mode | What it does |
-|---|------|-------------|
-| | **Standard** | Classic Gaussian blur glow |
-| | **Directional Glare** | Star/cross streaks from bright areas |
-| | **Kawase** | Progressive pyramid bloom (smooth, efficient) |
-| | **Soft Focus** | Dreamy full-scene glow |
+| Mode | What it does |
+|------|--------------|
+| **Standard** | Classic Gaussian blur glow |
+| **Directional Glare** | Star/cross streaks from bright areas |
+| **Kawase** | Progressive pyramid bloom (smooth, efficient) |
+| **Soft Focus** | Dreamy full-scene glow |
 
 **Compositing:** 7 blend modes (Screen, Overlay, Soft Light, Hard Light, Lighten, Multiply, Additive) · color tinting · saturation · highlight protection · quality controls
 
@@ -91,3 +91,8 @@ Physical camera model — **ISO**, **Shutter Speed**, **Aperture** — for expos
 - **Blend Amount** — Crossfade original ↔ processed
 - **Split Screen** — Side-by-side comparison (left = original, right = processed)
 - **Debug Logging** — Print shader parameters to log
+
+### Compiling
+
+```bat
+.\Engine\Build\BatchFiles\Build.bat UnrealEditor Win64 Development -Plugin="YourDriveLetter\UnrealEngine-5.6.1-release\Engine\Plugins\Experimental\ToneMapFX\ToneMapFX.uplugin"
