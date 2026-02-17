@@ -96,3 +96,27 @@ Physical camera model — **ISO**, **Shutter Speed**, **Aperture** — for expos
 
 ```bat
 .\Engine\Build\BatchFiles\Build.bat UnrealEditor Win64 Development -Plugin="YourDriveLetter\UnrealEngine-5.6.1-release\Engine\Plugins\Experimental\ToneMapFX\ToneMapFX.uplugin"
+```
+
+## References & Further Reading
+
+### Tonemapping Operators
+- **[Tonemapping — 64](https://64.github.io/tonemapping/)** — Excellent overview of tonemapping operators including Reinhard, Reinhard-Jodie, and Hable (Uncharted 2). This plugin's film curve implementations are based on the formulas described here.
+
+### Hable (Uncharted 2) Filmic Curve
+John Hable's filmic tonemapping curve, originally developed for *Uncharted 2*, uses a parametric function with 6 constants (Shoulder Strength, Linear Strength, Linear Angle, Toe Strength, Toe Numerator, Toe Denominator) plus a White Point. It produces a natural-looking film response with controllable shoulder rolloff, a linear middle region, and a lifted toe — closely matching how real film stock responds to light.
+
+- **[John Hable — Filmic Tonemapping Operators (GDC 2010)](http://filmicworlds.com/blog/filmic-tonemapping-operators/)** — Original blog post describing the curve.
+
+### Reinhard Tonemapping
+Based on Reinhard et al., *"Photographic Tone Reproduction for Digital Images"* (SIGGRAPH 2002). The plugin implements three variants:
+- **Standard** — Per-channel extended Reinhard: `L × (1 + L/Lw²) / (1 + L)` where Lw is the white point.
+- **Luminance** — Applied to luminance only, then RGB is rescaled by the luminance ratio. Preserves hue and saturation better than per-channel.
+- **Jodie** — A hybrid by shadertoy user Jodie that interpolates between luminance-preserved and per-channel Reinhard, using the per-channel result as the blend weight. Produces subtle desaturation in bright areas.
+
+### Krawczyk Auto-Exposure
+Based on Krawczyk, Myszkowski & Seidel, *"Lightness Perception in Tone Reproduction for Interactive Walkthroughs"* (Computer Graphics Forum, 2005). The algorithm:
+1. Measures the **geometric mean luminance** of the scene (log-average across a 16×16 sampling grid).
+2. Estimates a **scene key** automatically: `key = 1.03 − 2 / (2 + log₂(Lavg + 1))` — bright scenes get a lower key (darker exposure), dark scenes get a higher key (brighter exposure).
+3. Applies **temporal adaptation** with asymmetric speed — faster when brightening (eye closing), slower when darkening (eye opening) — to simulate human visual adaptation.
+**[Krawczyk Auto-Exposure doc](https://resources.mpi-inf.mpg.de/hdr/lightness/krawczyk05eg.pdf)**
