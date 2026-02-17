@@ -1,0 +1,414 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Composite bloom back onto scene color
+
+// Parameters are bound from C++ SHADER_PARAMETER_STRUCT
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+Texture2D BloomTexture;
+SamplerState BloomSampler;
+float4 OutputViewportSizeAndInvSize;
+FScreenTransform SvPositionToSceneColorUV; // Transform from SvPosition to scene color texture UV
+FScreenTransform SvPositionToBloomUV;      // Transform from SvPosition to bloom texture UV
+float BloomIntensity;
+float4 BloomTint;
+float BloomBlendMode; // 0=Screen, 1=Overlay, 2=SoftLight, 3=HardLight, 4=Lighten, 5=Multiply, 6=Additive
+float BloomSaturation; // Saturation multiplier for bloom colors
+float bProtectHighlights; // 1.0 = enabled, 0.0 = disabled
+float HighlightProtection; // Strength of highlight protection (0.0-1.0)
+float SoftFocusIntensity;
+float4 SoftFocusParams; // x=OverlayMult, y=BlendStrength, z=SoftLightMult, w=FinalBlend
+float bUseAdaptiveScaling; // 1.0 = enabled, 0.0 = disabled
+float bShowBloomOnly; // Debug: show only bloom buffer
+float bShowGammaCompensation; // Debug: visualize gamma compensation
+float bIsGameWorld; // 1.0 if game/PIE world, 0.0 if editor
+float GameModeBloomScale; // Manual compensation for game mode
+float bUseBrightnessCompensation; // 1.0 = enabled, 0.0 = disabled
+float BrightnessCompensationMode; // 0=EnergyConservation, 1=AutoIntensity, 2=ExposureAware
+float BrightnessCompensationStrength; // 0.0-1.0
+float ExposureCompensation; // Direct exposure offset (EV, e.g., -1 = half brightness)
+
+// Adjust saturation of a color
+// Saturation = 1.0: no change, >1.0 = more saturated, <1.0 = desaturated
+float3 AdjustSaturation(float3 Color, float Saturation)
+{
+	// Calculate luminance (grayscale value)
+	float Luminance = dot(Color, float3(0.299, 0.587, 0.114));
+	
+	// Lerp between grayscale and original color based on saturation
+	// Saturation 0.0 = full grayscale, 1.0 = original, 2.0 = double saturation
+	return lerp(Luminance.xxx, Color, Saturation);
+}
+
+// Protect highlights from over-brightening (prevents washing out to white)
+// Uses soft-clipping to preserve color while limiting brightness
+float3 ProtectHighlights(float3 Color, float Protection)
+{
+	if (Protection <= 0.0)
+		return Color;
+	
+	// Calculate luminance
+	float Luma = dot(Color, float3(0.299, 0.587, 0.114));
+	
+	// Soft-clip highlights using a smooth curve
+	// Protection 0.0 = no effect, 1.0 = maximum protection
+	float Threshold = lerp(2.0, 0.8, Protection); // Lower threshold = more protection
+	float SoftClip = Threshold + (1.0 - Threshold) * tanh((Luma - Threshold) / (1.0 - Threshold));
+	
+	// Apply soft-clip while preserving color ratios
+	float Scale = (Luma > 0.001) ? (SoftClip / Luma) : 1.0;
+	return Color * saturate(Scale);
+}
+
+// ============================================================================
+// Brightness Compensation Functions
+// Prevents bloom from over-exposing the scene
+// ============================================================================
+
+// Mode 0: Luminance Preserve (RECOMMENDED)
+// Locks overall scene luminance - bloom redistributes light without adding brightness
+// This is the most aggressive mode - works well with high bloom intensity (2-5+)
+float3 ApplyLuminancePreserve(float3 SceneColor, float3 BloomEffect, float Strength)
+{
+	// Calculate original scene luminance
+	float SceneLuma = dot(SceneColor, float3(0.299, 0.587, 0.114));
+	
+	// Add bloom to scene
+	float3 Combined = SceneColor + BloomEffect;
+	
+	// Calculate combined luminance
+	float CombinedLuma = dot(Combined, float3(0.299, 0.587, 0.114));
+	
+	// Calculate ratio to restore original luminance
+	float LumaRatio = (CombinedLuma > 0.001) ? (SceneLuma / CombinedLuma) : 1.0;
+	
+	// Lerp between full compensation and no compensation based on strength
+	float FinalRatio = lerp(1.0, LumaRatio, Strength);
+	
+	// Apply ratio to preserve luminance while keeping bloom distribution
+	return Combined * FinalRatio;
+}
+
+// Mode 1: Energy Conservation
+// Dims scene proportionally to bloom contribution
+float3 ApplyEnergyConservation(float3 SceneColor, float3 BloomEffect, float Strength)
+{
+	float BloomLuma = dot(BloomEffect, float3(0.299, 0.587, 0.114));
+	// Scale by bloom intensity to make it more aggressive
+	float Conservation = saturate(1.0 - BloomLuma * Strength * 2.0);
+	return SceneColor * Conservation + BloomEffect;
+}
+
+// Mode 2: Auto Intensity Scaling  
+// Scales bloom inversely to scene brightness - brighter scenes get less bloom
+float3 ApplyAutoIntensityScaling(float3 SceneColor, float3 BloomEffect, float Strength)
+{
+	float SceneLuma = dot(SceneColor, float3(0.299, 0.587, 0.114));
+	float BloomLuma = dot(BloomEffect, float3(0.299, 0.587, 0.114));
+	// More aggressive scaling based on combined brightness
+	float AutoScale = 1.0 / (1.0 + (SceneLuma + BloomLuma) * Strength * 2.0);
+	return SceneColor + BloomEffect * AutoScale;
+}
+
+// Mode 3: Exposure Aware
+// Uses bloom luminance to balance - dims both scene and bloom proportionally
+float3 ApplyExposureAware(float3 SceneColor, float3 BloomEffect, float BloomLuma, float Strength)
+{
+	// Calculate combined brightness
+	float CombinedLuma = dot(SceneColor + BloomEffect, float3(0.299, 0.587, 0.114));
+	
+	// Soft compression curve - higher combined luma = more compression
+	float Compression = 1.0 / (1.0 + CombinedLuma * Strength);
+	
+	return (SceneColor + BloomEffect) * Compression;
+}
+
+// Apply blend mode to bloom effect (HDR-safe)
+// Base = Scene color, Blend = Bloom effect
+// All modes handle values > 1.0 correctly to prevent negative output / blown highlights
+float3 ApplyBloomBlendMode(float3 Base, float3 Blend, float Mode)
+{
+	// Mode 0: Screen blend - Photographic glow (recommended)
+	// HDR-safe: A + B*(1-A), clamping (1-A) to prevent negative contribution
+	// For LDR [0,1] inputs this is identical to the standard formula: A + B - A*B
+	// For HDR: naturally adds bloom only to darker areas; bright areas (Base>1) get no extra bloom
+	if (Mode < 0.5)
+	{
+		return Base + Blend * max(1.0 - Base, 0.0);
+	}
+	
+	// For Overlay, SoftLight, HardLight: these require [0,1] inputs
+	// Clamp inputs for blend math, preserve HDR excess from base
+	float3 BaseLDR = saturate(Base);
+	float3 BlendLDR = saturate(Blend);
+	float3 BaseHDRExcess = max(Base - 1.0, 0.0);
+	
+	// Mode 1: Overlay blend - High contrast glow
+	if (Mode < 1.5)
+	{
+		float3 Blended = lerp(
+			2.0 * BaseLDR * BlendLDR,
+			1.0 - 2.0 * (1.0 - BaseLDR) * (1.0 - BlendLDR),
+			step(0.5, BaseLDR)
+		);
+		return Blended + BaseHDRExcess;
+	}
+	
+	// Mode 2: Soft light blend - Gentle, subtle glow
+	if (Mode < 2.5)
+	{
+		float3 Blended = lerp(
+			2.0 * BaseLDR * BlendLDR + BaseLDR * BaseLDR * (1.0 - 2.0 * BlendLDR),
+			sqrt(max(BaseLDR, 0.0)) * (2.0 * BlendLDR - 1.0) + 2.0 * BaseLDR * (1.0 - BlendLDR),
+			step(0.5, BlendLDR)
+		);
+		return Blended + BaseHDRExcess;
+	}
+	
+	// Mode 3: Hard light blend - Intense, punchy glow
+	if (Mode < 3.5)
+	{
+		float3 Blended = lerp(
+			2.0 * BaseLDR * BlendLDR,
+			1.0 - 2.0 * (1.0 - BaseLDR) * (1.0 - BlendLDR),
+			step(0.5, BlendLDR)
+		);
+		return Blended + BaseHDRExcess;
+	}
+	
+	// Mode 4: Lighten blend - Only brightens, never darkens (already HDR-safe)
+	if (Mode < 4.5)
+	{
+		return max(Base, Blend);
+	}
+	
+	// Mode 5: Multiply blend - Darkens scene with bloom (already HDR-safe)
+	if (Mode < 5.5)
+	{
+		return Base * Blend;
+	}
+	
+	// Mode 6: Additive blend - Pure light addition (already HDR-safe)
+	return Base + Blend;
+}
+
+void CompositeBloomPS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	// Use FScreenTransform to properly map SvPosition to texture UVs
+	// This handles all viewport offset and texture extent calculations correctly
+	float2 SceneColorUV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float2 BloomUV = ApplyScreenTransform(SvPosition.xy, SvPositionToBloomUV);
+	
+	// Sample textures
+	float3 SceneColor = Texture2DSample(SceneColorTexture, SceneColorSampler, SceneColorUV).rgb;
+	float3 BloomSample = Texture2DSample(BloomTexture, BloomSampler, BloomUV).rgb;
+	
+	// Calculate luminance for adaptive scaling
+	float SceneLuminance = dot(SceneColor, float3(0.299, 0.587, 0.114));
+	
+	// Bloom scaling calculation
+	float BloomScale = 1.0;
+	
+	if (bUseAdaptiveScaling > 0.5)
+	{
+		// Adaptive scaling based on scene brightness
+		float SceneBrightness = SceneLuminance + 0.001;
+		float AdaptiveScale = saturate(1.0 / (1.0 + SceneBrightness * 2.0));
+		BloomScale = lerp(0.7, 1.0, AdaptiveScale);
+	}
+	else if (bIsGameWorld > 0.5)
+	{
+		// In game/PIE mode, apply manual compensation
+		BloomScale = GameModeBloomScale;
+	}
+	// else: Editor mode, use BloomScale = 1.0
+	
+	// Start with scene color
+	float3 Result = SceneColor;
+	
+	// Debug visualizations
+	if (bShowBloomOnly > 0.5)
+	{
+		// Show only the bloom buffer for debugging
+		OutColor.rgb = BloomSample * BloomIntensity * 10.0; // Boosted for visibility
+		OutColor.a = 1.0;
+		return;
+	}
+	
+	if (bShowGammaCompensation > 0.5)
+	{
+		// Visualize the actual scene color values to check for exposure differences
+		// If PIE shows brighter colors here, the scene texture itself has higher values
+		// This would indicate pre-exposure or auto-exposure differences
+		
+		// Show scene color boosted for visibility
+		// If this looks different between editor and PIE, that's the root cause
+		OutColor.rgb = SceneColor * 2.0; // Boost 2x to see differences better
+		OutColor.a = 1.0;
+		return;
+	}
+	
+	// Determine if we have any effects to apply
+	bool bHasBloom = BloomIntensity > 0.0;
+	bool bHasSoftFocus = SoftFocusIntensity > 0.0;
+	
+	if (!bHasBloom && !bHasSoftFocus)
+	{
+		// No effects, return scene color as-is
+		OutColor.rgb = SceneColor;
+		OutColor.a = 1.0;
+		return;
+	}
+	
+	// Apply exposure compensation to scene color BEFORE adding bloom
+	// This darkens the base scene while keeping bloom at full intensity
+	// ExposureCompensation in EV: -1 = half brightness, -2 = quarter brightness, etc.
+	float3 ExposedScene = SceneColor;
+	if (abs(ExposureCompensation) > 0.001)
+	{
+		float ExposureMultiplier = pow(2.0, ExposureCompensation);
+		ExposedScene = SceneColor * ExposureMultiplier;
+	}
+	
+	// Apply effects based on what's enabled
+	// Soft focus and bloom are now independent
+	// Note: BloomTint.a encodes bUseSceneColor flag (1.0 = use scene color, 0.0 = use tint)
+	bool bUseSceneColor = BloomTint.a > 0.5;
+	
+	// Unpack soft focus tuning parameters
+	float SoftFocusOverlayMult = SoftFocusParams.x;
+	float SoftFocusBlendStrength = SoftFocusParams.y;
+	float SoftFocusSoftLightMult = SoftFocusParams.z;
+	float SoftFocusFinalBlend = SoftFocusParams.w;
+	
+	if (bHasSoftFocus && bHasBloom)
+	{
+		// Both effects enabled: Apply them separately to avoid coupling
+		
+		// Soft focus: Full-scene subtle glow without raising exposure
+		// Use overlay blending which darkens darks and brightens brights (HDR-safe)
+		float3 SoftGlow = BloomSample * SoftFocusIntensity * SoftFocusOverlayMult * BloomScale;
+		float3 SceneLDR = saturate(ExposedScene);
+		float3 GlowLDR = saturate(SoftGlow);
+		float3 SceneExcess = max(ExposedScene - 1.0, 0.0);
+		float3 SoftFocusResult = lerp(
+			2.0 * SceneLDR * GlowLDR,
+			1.0 - 2.0 * (1.0 - SceneLDR) * (1.0 - GlowLDR),
+			step(0.5, SceneLDR)
+		) + SceneExcess;
+		
+		// Blend soft focus with scene based on tunable blend strength
+		Result = lerp(ExposedScene, SoftFocusResult, saturate(SoftFocusIntensity * SoftFocusBlendStrength));
+		
+		// Bloom: Highlights only with optional tint
+		float3 BloomColor = bUseSceneColor ? BloomSample : (BloomSample * BloomTint.rgb);
+		// Apply saturation boost to make bloom more vibrant
+		BloomColor = AdjustSaturation(BloomColor, BloomSaturation);
+		// Apply highlight protection if enabled (prevents washing out to white)
+		if (bProtectHighlights > 0.5)
+		{
+			BloomColor = ProtectHighlights(BloomColor, HighlightProtection);
+		}
+		float3 BloomEffect = BloomColor * BloomIntensity * BloomScale;
+		
+		// Apply bloom with brightness compensation or standard blend mode
+		if (bUseBrightnessCompensation > 0.5)
+		{
+			float BloomLuma = dot(BloomEffect, float3(0.299, 0.587, 0.114));
+			// Mode 0: Luminance Preserve, 1: Energy Conservation, 2: Auto Intensity, 3: Exposure Aware
+			if (BrightnessCompensationMode < 0.5)
+				Result = ApplyLuminancePreserve(Result, BloomEffect, BrightnessCompensationStrength);
+			else if (BrightnessCompensationMode < 1.5)
+				Result = ApplyEnergyConservation(Result, BloomEffect, BrightnessCompensationStrength);
+			else if (BrightnessCompensationMode < 2.5)
+				Result = ApplyAutoIntensityScaling(Result, BloomEffect, BrightnessCompensationStrength);
+			else
+				Result = ApplyExposureAware(Result, BloomEffect, BloomLuma, BrightnessCompensationStrength);
+		}
+		else
+		{
+			Result = ApplyBloomBlendMode(Result, BloomEffect, BloomBlendMode);
+		}
+	}
+	else if (bHasSoftFocus)
+	{
+		// Soft Focus mode: Full-scene dreamy glow
+		// The key difference from regular bloom is the LOW THRESHOLD (captures full scene)
+		// But we still use the user's selected blend mode for flexibility
+		
+		// Apply tint if needed
+		float3 SoftFocusColor = bUseSceneColor ? BloomSample : (BloomSample * BloomTint.rgb);
+		
+		// Apply saturation boost
+		SoftFocusColor = AdjustSaturation(SoftFocusColor, BloomSaturation);
+		
+		// Apply highlight protection if enabled
+		if (bProtectHighlights > 0.5)
+		{
+			SoftFocusColor = ProtectHighlights(SoftFocusColor, HighlightProtection);
+		}
+		
+		// Create the soft focus effect
+		float3 SoftFocusEffect = SoftFocusColor * SoftFocusIntensity * BloomScale;
+		
+		// Apply with brightness compensation or standard blend mode
+		if (bUseBrightnessCompensation > 0.5)
+		{
+			float BloomLuma = dot(SoftFocusEffect, float3(0.299, 0.587, 0.114));
+			// Mode 0: Luminance Preserve, 1: Energy Conservation, 2: Auto Intensity, 3: Exposure Aware
+			if (BrightnessCompensationMode < 0.5)
+				Result = ApplyLuminancePreserve(ExposedScene, SoftFocusEffect, BrightnessCompensationStrength);
+			else if (BrightnessCompensationMode < 1.5)
+				Result = ApplyEnergyConservation(ExposedScene, SoftFocusEffect, BrightnessCompensationStrength);
+			else if (BrightnessCompensationMode < 2.5)
+				Result = ApplyAutoIntensityScaling(ExposedScene, SoftFocusEffect, BrightnessCompensationStrength);
+			else
+				Result = ApplyExposureAware(ExposedScene, SoftFocusEffect, BloomLuma, BrightnessCompensationStrength);
+		}
+		else
+		{
+			Result = ApplyBloomBlendMode(ExposedScene, SoftFocusEffect, BloomBlendMode);
+		}
+	}
+	else if (bHasBloom)
+	{
+		// Only bloom: Classic highlight glow
+		float3 BloomColor = bUseSceneColor ? BloomSample : (BloomSample * BloomTint.rgb);
+		// Apply saturation boost to make bloom more vibrant
+		BloomColor = AdjustSaturation(BloomColor, BloomSaturation);
+		// Apply highlight protection if enabled (prevents washing out to white)
+		if (bProtectHighlights > 0.5)
+		{
+			BloomColor = ProtectHighlights(BloomColor, HighlightProtection);
+		}
+		float3 BloomEffect = BloomColor * BloomIntensity * BloomScale;
+		
+		// Apply bloom with brightness compensation or standard blend mode
+		if (bUseBrightnessCompensation > 0.5)
+		{
+			float BloomLuma = dot(BloomEffect, float3(0.299, 0.587, 0.114));
+			// Mode 0: Luminance Preserve, 1: Energy Conservation, 2: Auto Intensity, 3: Exposure Aware
+			if (BrightnessCompensationMode < 0.5)
+				Result = ApplyLuminancePreserve(ExposedScene, BloomEffect, BrightnessCompensationStrength);
+			else if (BrightnessCompensationMode < 1.5)
+				Result = ApplyEnergyConservation(ExposedScene, BloomEffect, BrightnessCompensationStrength);
+			else if (BrightnessCompensationMode < 2.5)
+				Result = ApplyAutoIntensityScaling(ExposedScene, BloomEffect, BrightnessCompensationStrength);
+			else
+				Result = ApplyExposureAware(ExposedScene, BloomEffect, BloomLuma, BrightnessCompensationStrength);
+		}
+		else
+		{
+			Result = ApplyBloomBlendMode(ExposedScene, BloomEffect, BloomBlendMode);
+		}
+	}
+	
+	OutColor.rgb = Result;
+	OutColor.a = 1.0;
+}

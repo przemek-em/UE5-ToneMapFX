@@ -1,0 +1,122 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Directional glare shader
+// Creates star/cross patterns from bright areas with exponential falloff
+
+// Parameters are bound from C++ SHADER_PARAMETER_STRUCT
+Texture2D SourceTexture;
+SamplerState SourceSampler;
+float4 BufferSizeAndInvSize;
+float2 StreakDirection; // Normalized direction vector for this streak
+float StreakLength; // Length in texels
+float StreakFalloff; // Exponential falloff rate (higher = faster falloff)
+
+// Number of samples along the streak (performance vs quality tradeoff)
+#define STREAK_SAMPLES 16
+
+void GlareStreakPS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	float2 UV = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 TexelSize = BufferSizeAndInvSize.zw;
+	
+	// Sample step in texel space
+	float2 StepOffset = StreakDirection * TexelSize * (StreakLength / float(STREAK_SAMPLES));
+	
+	// Accumulate samples with exponential falloff in both directions
+	float3 Result = float3(0, 0, 0);
+	float TotalWeight = 0.0;
+	
+	// Sample center
+	float2 CenterUV = saturate(UV);
+	float CenterWeight = 1.0;
+	Result += Texture2DSample(SourceTexture, SourceSampler, CenterUV).rgb * CenterWeight;
+	TotalWeight += CenterWeight;
+	
+	// Sample along positive direction
+	UNROLL
+	for (int i = 1; i <= STREAK_SAMPLES; i++)
+	{
+		float Distance = float(i) / float(STREAK_SAMPLES);
+		float Weight = exp(-Distance * StreakFalloff);
+		
+		if (Weight < 0.001) continue; // Skip negligible weights
+		
+		float2 SampleUV = saturate(UV + StepOffset * float(i));
+		Result += Texture2DSample(SourceTexture, SourceSampler, SampleUV).rgb * Weight;
+		TotalWeight += Weight;
+	}
+	
+	// Sample along negative direction
+	UNROLL
+	for (int j = 1; j <= STREAK_SAMPLES; j++)
+	{
+		float Distance = float(j) / float(STREAK_SAMPLES);
+		float Weight = exp(-Distance * StreakFalloff);
+		
+		if (Weight < 0.001) continue; // Skip negligible weights
+		
+		float2 SampleUV = saturate(UV - StepOffset * float(j));
+		Result += Texture2DSample(SourceTexture, SourceSampler, SampleUV).rgb * Weight;
+		TotalWeight += Weight;
+	}
+	
+	// Normalize by total weight
+	Result /= TotalWeight;
+	
+	OutColor = float4(Result, 1.0);
+}
+
+// Accumulate multiple glare streak textures
+// This pass combines all directional streaks into final glare
+
+Texture2D StreakTexture0;
+Texture2D StreakTexture1;
+Texture2D StreakTexture2;
+Texture2D StreakTexture3;
+SamplerState StreakSampler;
+float4 GlareViewportSizeAndInvSize;
+int NumStreaks; // How many streak textures are valid (2-4, others done in multiple passes)
+
+void GlareAccumulatePS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	float2 UV = SvPosition.xy * GlareViewportSizeAndInvSize.zw;
+	float2 ClampedUV = saturate(UV);
+	
+	float3 Result = float3(0, 0, 0);
+	int Count = 0;
+	
+	// Always sample first two
+	Result += Texture2DSample(StreakTexture0, StreakSampler, ClampedUV).rgb;
+	Count++;
+	
+	if (NumStreaks >= 2)
+	{
+		Result += Texture2DSample(StreakTexture1, StreakSampler, ClampedUV).rgb;
+		Count++;
+	}
+	
+	if (NumStreaks >= 3)
+	{
+		Result += Texture2DSample(StreakTexture2, StreakSampler, ClampedUV).rgb;
+		Count++;
+	}
+	
+	if (NumStreaks >= 4)
+	{
+		Result += Texture2DSample(StreakTexture3, StreakSampler, ClampedUV).rgb;
+		Count++;
+	}
+	
+	// Average the streaks
+	Result /= float(Count);
+	
+	OutColor = float4(Result, 1.0);
+}

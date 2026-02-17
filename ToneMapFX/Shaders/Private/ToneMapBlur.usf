@@ -1,0 +1,54 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Tone Map FX — Separable Gaussian Blur (used for Clarity)
+// Reusable for horizontal and vertical passes via BlurDirection parameter.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// ---- Parameters (bound from FToneMapBlurPS::FParameters) ----
+Texture2D    SourceTexture;
+SamplerState SourceSampler;
+float4       BufferSizeAndInvSize;   // xy = output size, zw = 1/output size
+float2       BlurDirection;          // (1,0) = horizontal, (0,1) = vertical
+float        BlurRadius;             // spread multiplier (default 8)
+float4       SourceViewportRect;     // xy = Min, zw = Max (of source texture viewport)
+float4       SourceExtentInv;        // xy = 1/source extent, zw = unused
+
+// ---- 9-tap Gaussian weights (sigma ≈ 1.5) ----
+static const int   NUM_TAPS  = 5;
+static const float Weights[5] = { 0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216 };
+
+void GaussianBlurPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	// Map SvPosition (output texel coords) to source texture UV
+	// Normalize SvPosition in output space
+	float2 NormPos = SvPosition.xy * BufferSizeAndInvSize.zw;
+	// Map to source viewport texel position
+	float2 TexelPos = lerp(SourceViewportRect.xy, SourceViewportRect.zw, NormPos);
+	// Convert to source texture UV
+	float2 UV = TexelPos * SourceExtentInv.xy;
+
+	// Texel size in source UV space
+	float2 TexelSize = SourceExtentInv.xy;
+
+	// Epsilon for clamping to avoid sampling outside the texture
+	float2 Epsilon  = TexelSize * 0.5;
+	float2 ClampMin = Epsilon;
+	float2 ClampMax = 1.0 - Epsilon;
+
+	float2 SafeUV = clamp(UV, ClampMin, ClampMax);
+	float3 Result  = Texture2DSample(SourceTexture, SourceSampler, SafeUV).rgb * Weights[0];
+
+	[unroll]
+	for (int i = 1; i < NUM_TAPS; i++)
+	{
+		float2 Offset  = BlurDirection * TexelSize * float(i) * BlurRadius;
+		float2 UVPlus  = clamp(UV + Offset, ClampMin, ClampMax);
+		float2 UVMinus = clamp(UV - Offset, ClampMin, ClampMax);
+		Result += Texture2DSample(SourceTexture, SourceSampler, UVPlus).rgb  * Weights[i];
+		Result += Texture2DSample(SourceTexture, SourceSampler, UVMinus).rgb * Weights[i];
+	}
+
+	OutColor = float4(Result, 1.0);
+}

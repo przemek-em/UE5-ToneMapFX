@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Tone Map FX",
+	"Description": "Custom Post-process plugin simulating hable or reinhard curves, auto exposure, various bloom options",
+	"Category": "Rendering",
+	"CreatedBy": "Przemysław Mielniczenko",
+	"CreatedByURL": "https://www.linkedin.com/in/przemyslaw-mielniczenko/",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "ToneMapFX",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		}
+	]
+}

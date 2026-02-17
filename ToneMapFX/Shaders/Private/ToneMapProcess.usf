@@ -1,0 +1,966 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// ============================================================================
+// Two modes of operation:
+//
+// PostProcess mode (bReplaceTonemap == 0):
+//   Operates on LDR post-tonemapped data. Applies Tone Map adjustments.
+//
+// ReplaceTonemap mode (bReplaceTonemap == 1):
+//   Replaces UE's entire tonemapper with Hable or Reinhard filmic curve.
+//   Pipeline: PreExposure removal → Bloom composite → Tone Map adjustments →
+//   HDR Saturation → HDR Color Balance → Hable curve → sRGB gamma → Dithering
+// ============================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// ============================================================================
+// Shader Parameters (must match FToneMapProcessPS::FParameters exactly)
+// ============================================================================
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+Texture2D    BlurredTexture;
+SamplerState BlurredSampler;
+
+// FScreenTransform properly handles viewport offsets (fixes resize glitches)
+FScreenTransform SvPositionToSceneColorUV;
+FScreenTransform SvPositionToBlurredUV;
+float4           OutputViewportRect;        // xy = Min, zw = Max (for split screen)
+
+// Bloom (ReplaceTonemap mode)
+Texture2D    BloomTexture;
+SamplerState BloomSampler;
+FScreenTransform SvPositionToBloomUV;
+
+// Mode: 0 = PostProcess (LDR), 1 = ReplaceTonemap (HDR)
+float bReplaceTonemap;
+
+// Exposure removal (ReplaceTonemap mode)
+float OneOverPreExposure;
+float GlobalExposure;
+
+// Hable Film Curve params (ReplaceTonemap mode)
+float4 HableParams1;   // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
+float4 HableParams2;   // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
+float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd
+float  ReinhardWhitePoint; // Extended Reinhard L_white
+float  HDRSaturation;
+float3 HDRColorBalance;
+
+// Auto-Exposure (ReplaceTonemap mode)
+float AutoExposureMode;  // 0=None, 1=EngineDefault, 2=Krawczyk
+Texture2D    AdaptedLumTexture;
+SamplerState AdaptedLumSampler;
+float MinAutoExposure;
+float MaxAutoExposure;
+
+// White Balance
+float Temperature;     // -100 .. +100
+float Tint;            // -100 .. +100
+
+// Exposure
+float ExposureValue;   // stops (-5 .. +5)
+float CameraEV;        // derived from ISO/Shutter/Aperture
+float bUseCameraExposure;
+
+// Tone
+float Contrast;        // -100 .. +100
+float HighlightsValue; // -100 .. +100
+float ShadowsValue;    // -100 .. +100
+float WhitesValue;     // -100 .. +100
+float BlacksValue;     // -100 .. +100
+float ToneSmoothingValue; // 0 .. 100
+float ContrastMidpoint;   // 0.01 .. 0.5
+
+// Presence
+float ClarityStrength;   // -100 .. +100
+float VibranceStrength;  // -100 .. +100
+float SaturationStrength; // -100 .. +100
+
+// Dynamic Contrast — multi-scale blur textures
+Texture2D    BlurredFineTexture;
+SamplerState BlurredFineSampler;
+Texture2D    BlurredCoarseTexture;
+SamplerState BlurredCoarseSampler;
+FScreenTransform SvPositionToBlurredFineUV;
+FScreenTransform SvPositionToBlurredCoarseUV;
+
+// Dynamic Contrast — strengths
+float DynamicContrastStrength;    // 0 .. 100
+float CorrectContrastStrength;    // 0 .. 100
+float CorrectColorCastStrength;   // 0 .. 100
+
+// Tone Curve  (x = Highlights, y = Lights, z = Darks, w = Shadows)
+float4 ToneCurveParams;
+
+// HSL — packed float4(Reds, Oranges, Yellows, Greens) / float4(Aquas, Blues, Purples, Magentas)
+float4 HueShift1;
+float4 HueShift2;
+float4 SatAdj1;
+float4 SatAdj2;
+float4 LumAdj1;
+float4 LumAdj2;
+
+// HSL range smoothing
+float HSLSmoothing;    // 0 = sharpest cutoff, 100 = smoothest feather
+
+// Feature toggles & debug
+float bEnableHSL;
+float bEnableCurves;
+float BlendAmount;     // 0 = original, 1 = fully processed
+float bSplitScreen;    // left = original, right = processed
+
+// ============================================================================
+// Utility: Rec.709 luminance
+// ============================================================================
+
+float Luma(float3 c)
+{
+	return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+// ============================================================================
+// 1. White Balance
+// ============================================================================
+// Simplified chromatic adaptation along blue↔amber (Temperature) and
+// green↔magenta (Tint) axes.
+// ============================================================================
+
+float3 ApplyWhiteBalance(float3 color, float temp, float tint)
+{
+	float t = temp * 0.01;   // -1 .. +1
+	float n = tint * 0.01;
+
+	// Channel multipliers derived from perceptual colour-temperature shifts
+	float3 balance;
+	balance.r = 1.0 + t * 0.15;
+	balance.g = 1.0 - abs(t) * 0.03 - n * 0.10;
+	balance.b = 1.0 - t * 0.15;
+
+	return max(color * balance, 0.0);
+}
+
+// ============================================================================
+// 2. Exposure
+// ============================================================================
+
+float3 ApplyExposure(float3 color, float ev)
+{
+	return color * exp2(ev);
+}
+
+// ============================================================================
+// 3. Highlights / Shadows / Whites / Blacks
+// ============================================================================
+// Each slider operates on a specific luminance band, identified by a smooth
+// mask. The adjustment is a multiplicative lift / compress within that band.
+// ============================================================================
+
+float3 ApplyToneAdjustments(float3 color, float highlights, float shadows,
+							float whites, float blacks, float toneSmooth)
+{
+	float luma  = Luma(color);
+
+	// Use luminance directly (post-tonemapper input is already 0-1 LDR).
+	// For pre-tonemapper HDR, saturate clamps bright pixels to 1.0 which
+	// correctly places them in the highlights / whites region.
+	float mapped = saturate(luma);
+
+	// Feather: 0 = sharpest tonal isolation, 1 = widest overlap
+	float f = saturate(toneSmooth * 0.01);
+
+	// Smoothstep edges for each region, interpolated by feather
+	// Highlights: default [0.45, 0.85], sharp [0.60, 0.75], smooth [0.25, 0.95]
+	float hlLo = lerp(0.60, 0.25, f);
+	float hlHi = lerp(0.75, 0.95, f);
+	float highlightMask = smoothstep(hlLo, hlHi, mapped);
+
+	// Shadows: default inverted [0.15, 0.55], sharp [0.25, 0.40], smooth [0.05, 0.75]
+	float shLo = lerp(0.25, 0.05, f);
+	float shHi = lerp(0.40, 0.75, f);
+	float shadowMask = 1.0 - smoothstep(shLo, shHi, mapped);
+
+	// Whites: default [0.75, 1.0], sharp [0.85, 0.95], smooth [0.55, 1.0]
+	float whLo = lerp(0.85, 0.55, f);
+	float whHi = lerp(0.95, 1.00, f);
+	float whiteMask = smoothstep(whLo, whHi, mapped);
+
+	// Blacks: default inverted [0.0, 0.25], sharp [0.0, 0.12], smooth [0.0, 0.45]
+	float bkHi = lerp(0.12, 0.45, f);
+	float blackMask = 1.0 - smoothstep(0.00, bkHi, mapped);
+
+	// Compute combined multiplier
+	float adj = 1.0;
+	adj += highlights * 0.01 * highlightMask;
+	adj += shadows   * 0.01 * shadowMask;
+	adj += whites    * 0.01 * whiteMask;
+	adj += blacks    * 0.01 * blackMask;
+
+	return max(color * adj, 0.0);
+}
+
+// ============================================================================
+// 4. Contrast
+// ============================================================================
+// Power-based contrast around a perceptual midpoint (0.18 in linear).
+// ============================================================================
+
+float3 ApplyContrast(float3 color, float contrast, float midpoint)
+{
+	if (abs(contrast) < 0.01)
+		return color;
+
+	float c = 1.0 + contrast * 0.01;  // >1 = more contrast, <1 = less
+
+	// Protect zero/negative values
+	float3 sign_c = sign(color);
+	float3 abs_c  = max(abs(color), 0.0001);
+
+	float3 result  = sign_c * midpoint * pow(abs_c / midpoint, c);
+
+	return result;
+}
+
+// ============================================================================
+// 5. Clarity (local contrast via unsharp mask)
+// ============================================================================
+
+float3 ApplyClarity(float3 color, float3 blurred, float clarity)
+{
+	float3 detail = color - blurred;
+	// Soft-clip: suppresses extreme detail near bright HDR light sources
+	// In LDR (small detail ≈0.05) this is near-linear; in HDR it compresses.
+	detail = detail / (1.0 + abs(detail));
+	float3 adjustment = detail * clarity * 0.01;
+	// Never subtract more than 80% of pixel brightness (prevents black dot artifacts
+	// at edges of bright emitters where blur spreads high energy into dark neighbors)
+	adjustment = max(adjustment, -color * 0.8);
+	return max(color + adjustment, 0.0);
+}
+
+// ============================================================================
+// 5b. Dynamic Contrast (multi-scale local contrast)
+// ============================================================================
+// Extracts detail at 3 frequency bands (fine / medium / coarse) and selectively
+// boosts them. Operates primarily on midtones — shadows and highlights are
+// protected to avoid crushing blacks or blowing whites. Soft-clipping prevents
+// halo artifacts around high-contrast edges.
+//
+// Band decomposition (Laplacian-style):
+//   Fine detail   = original - blurFine   (high-frequency textures)
+//   Medium detail = blurFine - blurMed    (mid-frequency shape)
+//   Coarse detail = blurMed  - blurCoarse (low-frequency tonal shifts)
+// ============================================================================
+
+float3 ApplyDynamicContrast(float3 color, float3 blurFine, float3 blurMed,
+                            float3 blurCoarse, float strength)
+{
+	// Extract detail at each scale (Laplacian pyramid bands)
+	float3 detailFine   = color    - blurFine;    // high-freq texture
+	float3 detailMed    = blurFine - blurMed;     // mid-freq shape
+	float3 detailCoarse = blurMed  - blurCoarse;  // low-freq tonal variation
+
+	// Midtone protection mask: full effect on midtones, reduced on extremes.
+	// This prevents shadow crushing and highlight blowout.
+	float luma = Luma(color);
+	float lumaS = saturate(luma);
+	float midtoneMask = smoothstep(0.0, 0.15, lumaS) * smoothstep(1.0, 0.85, lumaS);
+
+	// Brightness-ratio guard: when blur bands carry much more energy than the
+	// pixel itself, we're near a bright emitter — dampen effect to prevent
+	// black dot artifacts from the negative detail driving pixels to zero.
+	float blurMaxLuma = max(Luma(blurFine), max(Luma(blurMed), Luma(blurCoarse)));
+	float brightnessGuard = 1.0 / (1.0 + max(blurMaxLuma - luma, 0.0) * 2.0);
+
+	// Weighted combination — emphasize fine and medium detail
+	float3 detail = detailFine * 0.45 + detailMed * 0.35 + detailCoarse * 0.20;
+
+	// Soft-clip detail to suppress halos (smooth compression)
+	detail = detail / (1.0 + abs(detail));
+
+	float s = strength * 0.01;
+	float3 adjustment = detail * s * midtoneMask * brightnessGuard * 2.5;
+
+	// Never subtract more than 80% of pixel brightness (prevents black dots)
+	adjustment = max(adjustment, -color * 0.8);
+	return max(color + adjustment, 0.0);
+}
+
+// ============================================================================
+// 5c. Dynamic Contrast — Correct Contrast (adaptive smart contrast)
+// ============================================================================
+// Unlike a global S-curve centered at 0.5, this analyzes local tonal
+// distribution (via the coarse blur approximating the local average) and pushes
+// pixel luminance away from that local average. The result is increased
+// perceived contrast that adapts to each region of the image.
+// Soft compression protects shadow and highlight extremes from clipping.
+// ============================================================================
+
+float3 ApplyCorrectContrast(float3 color, float3 blurCoarse, float strength)
+{
+	float localLuma = Luma(blurCoarse);
+	float luma      = Luma(color);
+
+	// Deviation from local average — positive = brighter than surroundings
+	float deviation = luma - localLuma;
+
+	// Scaled boost with soft compression to protect extremes
+	float s = strength * 0.01;
+	float boost = deviation * s;
+	boost = boost / (1.0 + abs(boost) * 2.0);
+
+	// Derive per-pixel multiplier
+	float factor = (luma > 0.0001) ? (luma + boost) / luma : 1.0;
+	factor = max(factor, 0.0);
+
+	return max(color * factor, 0.0);
+}
+
+// ============================================================================
+// 5d. Dynamic Contrast — Correct Color Cast (Gray World neutralization)
+// ============================================================================
+// Assumes the average of a well-exposed scene should be neutral grey (the
+// Gray World assumption). The coarse blur approximates the scene average
+// colour at each pixel's locality. Per-channel correction scales each channel
+// so the average becomes achromatic.
+// ============================================================================
+
+float3 ApplyCorrectColorCast(float3 color, float3 sceneAvg, float strength)
+{
+	// Average luminance — used as the neutral target
+	float avgLuma = Luma(sceneAvg);
+
+	// Per-channel correction factors: multiply so avg → neutral grey
+	float3 correction = avgLuma / max(sceneAvg, 0.001);
+
+	// Limit extreme corrections to prevent artifacts
+	correction = clamp(correction, 0.5, 2.0);
+
+	return lerp(color, color * correction, strength * 0.01);
+}
+
+// ============================================================================
+// 6. HSL Adjustments (per-colour-range)
+// ============================================================================
+
+// --- RGB ↔ HSL conversion (0-1 range) ---
+
+float3 RGBToHSL(float3 color)
+{
+	float maxC  = max(color.r, max(color.g, color.b));
+	float minC  = min(color.r, min(color.g, color.b));
+	float delta = maxC - minC;
+
+	float L = (maxC + minC) * 0.5;
+	float S = 0.0;
+	float H = 0.0;
+
+	if (delta > 0.0001)
+	{
+		S = (L > 0.5) ? delta / (2.0 - maxC - minC)
+					   : delta / (maxC + minC);
+
+		if (maxC == color.r)
+			H = (color.g - color.b) / delta + (color.g < color.b ? 6.0 : 0.0);
+		else if (maxC == color.g)
+			H = (color.b - color.r) / delta + 2.0;
+		else
+			H = (color.r - color.g) / delta + 4.0;
+
+		H /= 6.0;
+	}
+
+	return float3(H, S, L);
+}
+
+float HueToChannel(float p, float q, float t)
+{
+	if (t < 0.0) t += 1.0;
+	if (t > 1.0) t -= 1.0;
+	if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+	if (t < 0.5)        return q;
+	if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+	return p;
+}
+
+float3 HSLToRGB(float3 hsl)
+{
+	float H = hsl.x, S = hsl.y, L = hsl.z;
+
+	if (S < 0.0001)
+		return float3(L, L, L);
+
+	float q = (L < 0.5) ? L * (1.0 + S) : L + S - L * S;
+	float p = 2.0 * L - q;
+
+	return float3(
+		HueToChannel(p, q, H + 1.0 / 3.0),
+		HueToChannel(p, q, H),
+		HueToChannel(p, q, H - 1.0 / 3.0));
+}
+
+// --- Hue-range weight with wrap-around and adjustable smoothing ---
+// innerEdge = where weight starts falling off, outerEdge = where it reaches zero.
+// Uses a double-smoothstep for a bell-curve shape with controllable width.
+
+float HueRangeWeight(float hue, float center, float halfWidth, float feather)
+{
+	float dist = abs(hue - center);
+	dist = min(dist, 1.0 - dist);   // handle 0/1 wrap
+
+	// innerEdge: the hard selection core (sharpest selection)
+	// outerEdge: the soft falloff boundary
+	// feather (0..1) blends between sharp and smooth
+	float sharpWidth  = halfWidth * 0.3;  // tight selection
+	float smoothWidth = halfWidth * 2.5;  // wide feathered selection
+	float activeWidth  = lerp(sharpWidth, smoothWidth, feather);
+
+	// Smooth bell-curve: 1 at center, 0 at activeWidth
+	return smoothstep(activeWidth, activeWidth * 0.15, dist);
+}
+
+float3 ApplyHSL(float3 color,
+				float4 hueShift1, float4 hueShift2,
+				float4 satAdj1,   float4 satAdj2,
+				float4 lumAdj1,   float4 lumAdj2,
+				float smoothing)
+{
+	// Handle HDR: normalise into 0-1 range, remember peak
+	float peak = max(max(color.r, color.g), color.b);
+	float restoreScale = max(peak, 0.0001);
+	float3 normColor = (peak > 1.0) ? color / peak : color;
+
+	float3 hsl = RGBToHSL(normColor);
+
+	// Skip achromatic pixels (no meaningful hue)
+	if (hsl.y < 0.01)
+		return color;
+
+	// Feather amount: 0 = sharpest, 1 = smoothest
+	float feather = saturate(smoothing * 0.01);
+
+	// Hue centres (0-1 range): Reds 0, Oranges 30°, Yellows 60°, Greens 120°,
+	//                          Aquas 180°, Blues 240°, Purples 285°, Magentas 330°
+	float w0 = HueRangeWeight(hsl.x, 0.000, 0.069, feather);  // Reds
+	float w1 = HueRangeWeight(hsl.x, 0.083, 0.069, feather);  // Oranges
+	float w2 = HueRangeWeight(hsl.x, 0.167, 0.069, feather);  // Yellows
+	float w3 = HueRangeWeight(hsl.x, 0.333, 0.100, feather);  // Greens
+	float w4 = HueRangeWeight(hsl.x, 0.500, 0.083, feather);  // Aquas
+	float w5 = HueRangeWeight(hsl.x, 0.667, 0.083, feather);  // Blues
+	float w6 = HueRangeWeight(hsl.x, 0.792, 0.069, feather);  // Purples
+	float w7 = HueRangeWeight(hsl.x, 0.917, 0.069, feather);  // Magentas
+
+	float wTotal = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
+	float invW   = (wTotal > 0.001) ? 1.0 / wTotal : 0.0;
+
+	// Weighted-sum adjustments
+	float hueAdj = (w0 * hueShift1.x + w1 * hueShift1.y + w2 * hueShift1.z + w3 * hueShift1.w
+				  + w4 * hueShift2.x + w5 * hueShift2.y + w6 * hueShift2.z + w7 * hueShift2.w) * invW;
+
+	float satMod = (w0 * satAdj1.x + w1 * satAdj1.y + w2 * satAdj1.z + w3 * satAdj1.w
+				  + w4 * satAdj2.x + w5 * satAdj2.y + w6 * satAdj2.z + w7 * satAdj2.w) * invW;
+
+	float lumMod = (w0 * lumAdj1.x + w1 * lumAdj1.y + w2 * lumAdj1.z + w3 * lumAdj1.w
+				  + w4 * lumAdj2.x + w5 * lumAdj2.y + w6 * lumAdj2.z + w7 * lumAdj2.w) * invW;
+
+	// Apply — values come in as -100..+100, normalise here
+	hsl.x = frac(hsl.x + hueAdj * 0.002);           // ±0.2 hue range = ±72°
+	hsl.y = saturate(hsl.y * (1.0 + satMod * 0.01)); // multiplicative sat
+	hsl.z = saturate(hsl.z * (1.0 + lumMod * 0.01)); // multiplicative lum
+
+	float3 result = HSLToRGB(hsl);
+	return result * ((peak > 1.0) ? peak : 1.0);
+}
+
+// ============================================================================
+// 7. Vibrance
+// ============================================================================
+// Boosts saturation of under-saturated colours more than already-vivid colours,
+// and slightly protects skin tones (orange-ish hue range).
+// ============================================================================
+
+float3 ApplyVibrance(float3 color, float vibrance)
+{
+	if (abs(vibrance) < 0.01)
+		return color;
+
+	float v    = vibrance * 0.01;  // -1 .. +1
+	float luma = Luma(color);
+
+	// Measure existing saturation (rough)
+	float maxC = max(color.r, max(color.g, color.b));
+	float minC = min(color.r, min(color.g, color.b));
+	float sat  = (maxC > 0.0001) ? (maxC - minC) / maxC : 0.0;
+
+	// More boost for low-saturation pixels, less for already-saturated
+	float boostFactor = v * (1.0 - sat);
+
+	// Skin-tone protection: reduce effect near orange/red hues
+	float3 normC = color / max(maxC, 0.0001);
+	float isSkinTone = smoothstep(0.1, 0.3, normC.r - normC.b) *
+					   smoothstep(0.0, 0.15, normC.g - normC.b);
+	boostFactor *= lerp(1.0, 0.5, isSkinTone);
+
+	// Apply selective saturation
+	float finalSat = 1.0 + boostFactor;
+	return max(lerp(float3(luma, luma, luma), color, finalSat), 0.0);
+}
+
+// ============================================================================
+// 8. Global Saturation
+// ============================================================================
+
+float3 ApplySaturation(float3 color, float saturation)
+{
+	float s    = 1.0 + saturation * 0.01;
+	float luma = Luma(color);
+	return max(lerp(float3(luma, luma, luma), color, s), 0.0);
+}
+
+// ============================================================================
+// 9. Parametric Tone Curve
+// ============================================================================
+// Uses Bernstein basis polynomials (degree 3) to split the tonal range into
+// four smooth overlapping regions:
+//   B0(t) = (1-t)^3         → Shadows
+//   B1(t) = 3·t·(1-t)^2    → Darks
+//   B2(t) = 3·t^2·(1-t)    → Lights
+//   B3(t) = t^3             → Highlights
+// The sum B0+B1+B2+B3 ≡ 1, giving smooth partition-of-unity blending.
+// ============================================================================
+
+float ApplyParametricCurve(float x, float4 params)
+{
+	// params: x = Highlights, y = Lights, z = Darks, w = Shadows  (each -100..+100)
+	float h = params.x * 0.01;
+	float l = params.y * 0.01;
+	float d = params.z * 0.01;
+	float s = params.w * 0.01;
+
+	float t   = saturate(x);
+	float omt = 1.0 - t;
+
+	float B0 = omt * omt * omt;
+	float B1 = 3.0 * t * omt * omt;
+	float B2 = 3.0 * t * t * omt;
+	float B3 = t * t * t;
+
+	float adjustment = s * B0 + d * B1 + l * B2 + h * B3;
+	return saturate(t + adjustment * 0.5);
+}
+
+float3 ApplyToneCurve(float3 color, float4 params)
+{
+	color.r = ApplyParametricCurve(color.r, params);
+	color.g = ApplyParametricCurve(color.g, params);
+	color.b = ApplyParametricCurve(color.b, params);
+	return color;
+}
+
+// ============================================================================
+// Main Pixel Shader
+// ============================================================================
+
+// ============================================================================
+// Hable Filmic Tonemapping Curve
+// ============================================================================
+// Based on John Hable's curve:
+//   f(x) = (x(Ax + CB) + DE) / (x(Ax + B) + DF) - E/F
+// All 6 constants A-F are artist-adjustable. White point W defines the
+// input value that maps to output 1.0.
+// ============================================================================
+
+float3 HableFilmCurveRaw(float3 x, float A, float B, float C, float D, float E, float F)
+{
+	return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 HableFilmCurve(float3 color, float4 params1, float4 params2)
+{
+	// params1: x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
+	// params2: x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
+	float A = params1.x;  // Shoulder Strength
+	float B = params1.y;  // Linear Strength
+	float C = params1.z;  // Linear Angle
+	float D = params1.w;  // Toe Strength
+	float E = params2.x;  // Toe Numerator
+	float F = params2.y;  // Toe Denominator
+	float W = params2.z;  // White Point
+
+	float3 numerator   = HableFilmCurveRaw(color, A, B, C, D, E, F);
+	float3 denominator = HableFilmCurveRaw(float3(W, W, W), A, B, C, D, E, F);
+
+	return numerator / max(denominator, 0.0001);
+}
+
+// ============================================================================
+// Reinhard (Standard) — per-channel, extended with white point
+// ============================================================================
+// Extended Reinhard: L * (1 + L/Lw^2) / (1 + L)
+// When Lw is very large, reduces to basic C/(1+C).
+// Reference: Reinhard et al., "Photographic Tone Reproduction for Digital Images"
+// Reference: https://64.github.io/tonemapping/
+// ============================================================================
+
+float3 ReinhardStandard(float3 color, float Lw)
+{
+	float Lw2 = Lw * Lw;
+	return color * (1.0 + color / Lw2) / (1.0 + color);
+}
+
+// ============================================================================
+// Reinhard (Luminance) — applied to luminance, extended with white point
+// ============================================================================
+// Tone maps luminance only, then rescales RGB by the luminance ratio.
+// Preserves hue and saturation better than per-channel Reinhard.
+// Extended form: L_out = L * (1 + L/Lw^2) / (1 + L)
+// ============================================================================
+
+float3 ReinhardLuminance(float3 color, float Lw)
+{
+	float l = Luma(color);
+	float Lw2 = Lw * Lw;
+	float lNew = l * (1.0 + l / Lw2) / (1.0 + l);
+	return color * (lNew / max(l, 0.0001));
+}
+
+// ============================================================================
+// Reinhard-Jodie — hybrid with white point support
+// ============================================================================
+// By shadertoy user Jodie. Interpolates between luminance-preserved and
+// per-channel Reinhard using the per-channel result as the blend weight.
+// Extended with white point for both components.
+// ============================================================================
+
+float3 ReinhardJodie(float3 color, float Lw)
+{
+	float l = Luma(color);
+	float Lw2 = Lw * Lw;
+	float3 tv = color * (1.0 + color / Lw2) / (1.0 + color);  // per-channel extended
+	float lMapped = l * (1.0 + l / Lw2) / (1.0 + l);          // luminance extended
+	float3 lumPreserved = color * (lMapped / max(l, 0.0001));
+	return lerp(lumPreserved, tv, tv);  // blend toward per-channel in brights
+}
+
+// ============================================================================
+// Film Curve Selector — dispatches to the chosen tonemapping operator
+// ============================================================================
+
+float3 ApplyFilmCurve(float3 color, float mode, float4 hableParams1, float4 hableParams2, float reinhardWP)
+{
+	if (mode < 0.5)
+		return HableFilmCurve(color, hableParams1, hableParams2);  // 0 = Hable
+	else if (mode < 1.5)
+		return ReinhardLuminance(color, reinhardWP);               // 1 = Reinhard Luminance
+	else if (mode < 2.5)
+		return ReinhardJodie(color, reinhardWP);                   // 2 = Reinhard-Jodie
+	else
+		return ReinhardStandard(color, reinhardWP);                // 3 = Reinhard Standard
+}
+
+// ============================================================================
+// Exact sRGB gamma curve (IEC 61966-2-1)
+// ============================================================================
+
+float LinearToSRGBChannel(float val)
+{
+	if (val <= 0.0031308)
+		return val * 12.92;
+	else
+		return 1.055 * pow(val, 1.0 / 2.4) - 0.055;
+}
+
+float3 LinearToSRGB(float3 color)
+{
+	return float3(
+		LinearToSRGBChannel(color.r),
+		LinearToSRGBChannel(color.g),
+		LinearToSRGBChannel(color.b));
+}
+
+// ============================================================================
+// Triangular-distribution dithering (reduces banding in 8-bit output)
+// ============================================================================
+
+float InterleavedGradientNoise(float2 uv)
+{
+	float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+	return frac(magic.z * frac(dot(uv, magic.xy)));
+}
+
+float3 ApplyDithering(float3 color, float2 svPos)
+{
+	// Triangular distribution: two uniform samples → triangle PDF
+	float noise1 = InterleavedGradientNoise(svPos);
+	float noise2 = InterleavedGradientNoise(svPos + float2(47.0, 17.0));
+	float triangleNoise = noise1 + noise2 - 1.0; // range [-1, 1]
+
+	// Scale to half an 8-bit LSB
+	return color + triangleNoise / 255.0;
+}
+
+void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 originalColor = Texture2DSample(SceneColorTexture, SceneColorSampler, UV).rgb;
+	float3 color = originalColor;
+
+	if (bReplaceTonemap > 0.5)
+	{
+		// =================================================================
+		// REPLACE TONEMAP MODE — Full HDR pipeline
+		// Pipeline Exposure → Bloom → Grading → Hable → sRGB
+		// =================================================================
+
+		// --- 1. Remove pre-exposure (baked during rendering) ---
+		color *= OneOverPreExposure;
+
+		// --- 2. Auto-Exposure (mode-dependent) ---
+		float autoExposure = 1.0;
+		if (AutoExposureMode > 1.5) // Krawczyk
+		{
+			float adaptedLum = AdaptedLumTexture.Load(int3(0, 0, 0)).r;
+			// Krawczyk et al. 2005: automatic scene key estimation
+			// key = 1.03 - 2 / (2 + log2(L_avg + 1))
+			float sceneKey = 1.03 - 2.0 / (2.0 + log2(adaptedLum + 1.0));
+			autoExposure = clamp(sceneKey / max(adaptedLum, 0.0001),
+			                     MinAutoExposure, MaxAutoExposure);
+		}
+		else if (AutoExposureMode > 0.5) // Engine Default
+		{
+			autoExposure = GlobalExposure;
+		}
+		// else: None — autoExposure stays 1.0 (manual only)
+
+		color *= autoExposure;
+
+		// --- 3. Composite bloom ---
+		float2 BloomUV = ApplyScreenTransform(SvPosition.xy, SvPositionToBloomUV);
+		float3 bloom = Texture2DSample(BloomTexture, BloomSampler, BloomUV).rgb;
+		// Bloom also has pre-exposure baked in — remove it and apply same exposure
+		bloom *= OneOverPreExposure * autoExposure;
+		color += bloom;
+
+		// --- 4. White Balance (HDR) ---
+		color = ApplyWhiteBalance(color, Temperature, Tint);
+
+		// --- 5. Tone Map Exposure compensation ---
+		float ev = ExposureValue;
+		if (bUseCameraExposure > 0.5)
+			ev += CameraEV;
+		if (abs(ev) > 0.001)
+			color = ApplyExposure(color, ev);
+
+		// --- 6. Highlights / Shadows / Whites / Blacks ---
+		// In HDR, luminance values are unbounded. ApplyToneAdjustments uses
+		// saturate(luma) which clamps >1 to highlights/whites range — correct.
+		color = ApplyToneAdjustments(color, HighlightsValue, ShadowsValue,
+									 WhitesValue, BlacksValue, ToneSmoothingValue);
+
+		// --- 7. Contrast (HDR) ---
+		color = ApplyContrast(color, Contrast, ContrastMidpoint);
+
+		// --- 8. Clarity (local contrast) ---
+		if (abs(ClarityStrength) > 0.01)
+		{
+			float2 BlurUV2 = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredUV);
+			float3 blurred = Texture2DSample(BlurredTexture, BlurredSampler, BlurUV2).rgb;
+			// Blurred texture also has pre-exposure — remove it for consistent processing
+			blurred *= OneOverPreExposure * autoExposure;
+			color = ApplyClarity(color, blurred, ClarityStrength);
+		}
+
+		// --- 8b. Dynamic Contrast (multi-scale local contrast & color correction) ---
+		if (DynamicContrastStrength > 0.01 || CorrectContrastStrength > 0.01 || CorrectColorCastStrength > 0.01)
+		{
+			float2 FineUV   = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredFineUV);
+			float2 CoarseUV = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredCoarseUV);
+			float3 blurFine   = Texture2DSample(BlurredFineTexture,   BlurredFineSampler,   FineUV).rgb;
+			float3 blurCoarse = Texture2DSample(BlurredCoarseTexture, BlurredCoarseSampler, CoarseUV).rgb;
+			// Remove pre-exposure from blur textures for consistent HDR processing
+			blurFine   *= OneOverPreExposure * autoExposure;
+			blurCoarse *= OneOverPreExposure * autoExposure;
+
+			// Medium blur for Dynamic Contrast: reuse Clarity blur if available, else use Fine
+			float3 blurMed = blurFine;
+			if (abs(ClarityStrength) > 0.01)
+			{
+				float2 BlurUVMed = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredUV);
+				blurMed = Texture2DSample(BlurredTexture, BlurredSampler, BlurUVMed).rgb;
+				blurMed *= OneOverPreExposure * autoExposure;
+			}
+
+			if (CorrectColorCastStrength > 0.01)
+				color = ApplyCorrectColorCast(color, blurCoarse, CorrectColorCastStrength);
+			if (CorrectContrastStrength > 0.01)
+				color = ApplyCorrectContrast(color, blurCoarse, CorrectContrastStrength);
+			if (DynamicContrastStrength > 0.01)
+				color = ApplyDynamicContrast(color, blurFine, blurMed, blurCoarse, DynamicContrastStrength);
+		}
+
+		// --- 9. HSL per-colour adjustments ---
+		if (bEnableHSL > 0.5)
+		{
+			color = ApplyHSL(color,
+							 HueShift1, HueShift2,
+							 SatAdj1,   SatAdj2,
+							 LumAdj1,   LumAdj2,
+							 HSLSmoothing);
+		}
+
+		// --- 10. Vibrance ---
+		color = ApplyVibrance(color, VibranceStrength);
+
+		// --- 11. Global Saturation ---
+		color = ApplySaturation(color, SaturationStrength);
+
+		// --- 12. HDR Saturation (applied before tonemapping) ---
+		{
+			float luma = Luma(color);
+			color = lerp(float3(luma, luma, luma), color, HDRSaturation);
+		}
+
+		// --- 13. HDR Color Balance (pre-tonemap tint) ---
+		color *= HDRColorBalance;
+
+		// Protect against negative values before tonemapping
+		color = max(color, 0.0);
+
+		// --- 14. Tonemapping (selected film curve) ---
+		color = ApplyFilmCurve(color, FilmCurveMode, HableParams1, HableParams2, ReinhardWhitePoint);
+
+		// --- 15. Parametric Tone Curve (fine-tuning, now in LDR 0-1) ---
+		if (bEnableCurves > 0.5)
+		{
+			color = ApplyToneCurve(color, ToneCurveParams);
+		}
+
+		// --- 16. Linear → sRGB gamma conversion ---
+		color = saturate(color);
+		color = LinearToSRGB(color);
+
+		// --- 17. Dithering (reduce 8-bit banding) ---
+		color = ApplyDithering(color, SvPosition.xy);
+
+		// Clamp final output
+		color = saturate(color);
+	}
+	else
+	{
+		// =================================================================
+		// POST-PROCESS MODE — LDR adjustments (original pipeline)
+		// =================================================================
+
+		// --- 1. White Balance ---
+		color = ApplyWhiteBalance(color, Temperature, Tint);
+
+		// --- 2. Exposure ---
+		float ev = ExposureValue;
+		if (bUseCameraExposure > 0.5)
+			ev += CameraEV;
+		if (abs(ev) > 0.001)
+			color = ApplyExposure(color, ev);
+
+		// --- 3. Highlights / Shadows / Whites / Blacks ---
+		color = ApplyToneAdjustments(color, HighlightsValue, ShadowsValue,
+									 WhitesValue, BlacksValue, ToneSmoothingValue);
+
+		// --- 4. Contrast ---
+		color = ApplyContrast(color, Contrast, ContrastMidpoint);
+
+		// --- 5. Clarity (local contrast) ---
+		if (abs(ClarityStrength) > 0.01)
+		{
+			float2 BlurUV2 = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredUV);
+			float3 blurred = Texture2DSample(BlurredTexture, BlurredSampler, BlurUV2).rgb;
+			color = ApplyClarity(color, blurred, ClarityStrength);
+		}
+
+		// --- 5b. Dynamic Contrast (multi-scale local contrast & color correction) ---
+		if (DynamicContrastStrength > 0.01 || CorrectContrastStrength > 0.01 || CorrectColorCastStrength > 0.01)
+		{
+			float2 FineUV   = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredFineUV);
+			float2 CoarseUV = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredCoarseUV);
+			float3 blurFine   = Texture2DSample(BlurredFineTexture,   BlurredFineSampler,   FineUV).rgb;
+			float3 blurCoarse = Texture2DSample(BlurredCoarseTexture, BlurredCoarseSampler, CoarseUV).rgb;
+
+			// Medium blur for Dynamic Contrast: reuse Clarity blur if available, else use Fine
+			float3 blurMed = blurFine;
+			if (abs(ClarityStrength) > 0.01)
+			{
+				float2 BlurUVMed = ApplyScreenTransform(SvPosition.xy, SvPositionToBlurredUV);
+				blurMed = Texture2DSample(BlurredTexture, BlurredSampler, BlurUVMed).rgb;
+			}
+
+			if (CorrectColorCastStrength > 0.01)
+				color = ApplyCorrectColorCast(color, blurCoarse, CorrectColorCastStrength);
+			if (CorrectContrastStrength > 0.01)
+				color = ApplyCorrectContrast(color, blurCoarse, CorrectContrastStrength);
+			if (DynamicContrastStrength > 0.01)
+				color = ApplyDynamicContrast(color, blurFine, blurMed, blurCoarse, DynamicContrastStrength);
+		}
+
+		// --- 6. HSL per-colour adjustments ---
+		if (bEnableHSL > 0.5)
+		{
+			color = ApplyHSL(color,
+							 HueShift1, HueShift2,
+							 SatAdj1,   SatAdj2,
+							 LumAdj1,   LumAdj2,
+							 HSLSmoothing);
+		}
+
+		// --- 7. Vibrance ---
+		color = ApplyVibrance(color, VibranceStrength);
+
+		// --- 8. Global Saturation ---
+		color = ApplySaturation(color, SaturationStrength);
+
+		// --- 9. Parametric Tone Curve ---
+		if (bEnableCurves > 0.5)
+		{
+			color = ApplyToneCurve(color, ToneCurveParams);
+		}
+
+		// Clamp to prevent negative values after all processing
+		color = max(color, 0.0);
+	}
+
+	// --- 10. Blend / Debug ---
+	if (bSplitScreen > 0.5)
+	{
+		// Left half = original, right half = processed
+		float normX = (SvPosition.x - OutputViewportRect.x) / (OutputViewportRect.z - OutputViewportRect.x);
+		if (bReplaceTonemap > 0.5)
+		{
+			// In replace mode, show original with simple Reinhard + sRGB for comparison
+			float3 origHDR = originalColor * OneOverPreExposure * GlobalExposure;
+			float3 origTM = origHDR / (origHDR + 1.0);
+			origTM = LinearToSRGB(origTM);
+			color = (normX < 0.5) ? origTM : color;
+		}
+		else
+		{
+			color = (normX < 0.5) ? originalColor : color;
+		}
+	}
+	else
+	{
+		if (bReplaceTonemap > 0.5)
+		{
+			// In replace mode, blend between simple Reinhard and our processing
+			float3 origHDR = originalColor * OneOverPreExposure * GlobalExposure;
+			float3 origTM = origHDR / (origHDR + 1.0);
+			origTM = LinearToSRGB(origTM);
+			color = lerp(origTM, color, BlendAmount);
+		}
+		else
+		{
+			color = lerp(originalColor, color, BlendAmount);
+		}
+	}
+
+	OutColor = float4(color, 1.0);
+}

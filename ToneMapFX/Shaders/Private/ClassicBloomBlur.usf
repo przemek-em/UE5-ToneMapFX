@@ -1,0 +1,52 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Simple Gaussian blur shader - separable (horizontal or vertical pass)
+
+// Parameters are bound from C++ SHADER_PARAMETER_STRUCT
+Texture2D SourceTexture;
+SamplerState SourceSampler;
+float4 BufferSizeAndInvSize;
+float2 BlurDirection;
+float BlurRadius;
+
+void GaussianBlurPS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	// Blur operates on downsampled bloom texture (no viewport offset issues)
+	// Simple UV calculation is fine here
+	float2 UV = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 TexelSize = BufferSizeAndInvSize.zw;
+	
+	// Simple 9-tap Gaussian blur
+	// Using fixed weights for simplicity
+	float Weights[5] = { 0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216 };
+	
+	// CRITICAL FIX for edge darkening: Use clamped UVs with epsilon margin
+	// This ensures we sample valid pixels even at edges, extending border values
+	float2 Epsilon = TexelSize * 0.5; // Half-pixel margin
+	float2 ClampMin = Epsilon;
+	float2 ClampMax = 1.0 - Epsilon;
+	
+	// Clamp center UV to safe range
+	float2 SafeUV = clamp(UV, ClampMin, ClampMax);
+	float3 Result = Texture2DSample(SourceTexture, SourceSampler, SafeUV).rgb * Weights[0];
+	
+	// Sample in blur direction with clamped UVs for edge extension
+	for(int i = 1; i < 5; i++)
+	{
+		float2 Offset = BlurDirection * TexelSize * float(i) * BlurRadius;
+		// Clamp each sample to extend edge pixels (like terrain processing)
+		float2 UVPlus = clamp(UV + Offset, ClampMin, ClampMax);
+		float2 UVMinus = clamp(UV - Offset, ClampMin, ClampMax);
+		
+		Result += Texture2DSample(SourceTexture, SourceSampler, UVPlus).rgb * Weights[i];
+		Result += Texture2DSample(SourceTexture, SourceSampler, UVMinus).rgb * Weights[i];
+	}
+	
+	OutColor = float4(Result, 1.0);
+}

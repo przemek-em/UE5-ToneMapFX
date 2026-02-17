@@ -1,0 +1,87 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+// ============================================================================
+// Luminance Measurement Pass
+// ============================================================================
+// Renders to a 1x1 target. Samples scene color in a 16x16 grid across the
+// entire viewport and computes the geometric mean luminance.
+// ============================================================================
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+
+float4 SceneColorUVBounds; // xy = UVMin, zw = UVMax (viewport extent in texture UV)
+float  OneOverPreExposure;
+
+void LuminanceMeasurePS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const int GRID = 16;
+	const float TOTAL_SAMPLES = float(GRID * GRID); // 256
+	const float EPSILON = 0.0001;
+
+	float logLumSum = 0.0;
+
+	for (int y = 0; y < GRID; y++)
+	{
+		for (int x = 0; x < GRID; x++)
+		{
+			// Map grid position to scene UV within the valid viewport bounds
+			float2 uv = lerp(SceneColorUVBounds.xy, SceneColorUVBounds.zw,
+			                 (float2(x, y) + 0.5) / float(GRID));
+
+			float3 c = SceneColorTexture.SampleLevel(SceneColorSampler, uv, 0).rgb;
+
+			// Remove pre-exposure to get actual HDR radiance
+			c *= OneOverPreExposure;
+
+			// Rec.709 luminance
+			float L = dot(c, float3(0.2126, 0.7152, 0.0722));
+
+			// Accumulate in log-space for geometric mean
+			logLumSum += log(max(L, EPSILON));
+		}
+	}
+
+	// Geometric mean = exp(average of logs)
+	float geometricMean = exp(logLumSum / TOTAL_SAMPLES);
+
+	OutColor = float4(geometricMean, 0.0, 0.0, 1.0);
+}
+
+// ============================================================================
+// Luminance Temporal Adaptation Pass
+// ============================================================================
+// Renders to a 1x1 target. Blends the previous frame's adapted luminance
+// with the current measurement using asymmetric exponential smoothing
+// Different speeds for brightening (SpeedUp) and darkening (SpeedDown)
+// simulate the asymmetric nature of human eye adaptation.
+// ============================================================================
+
+Texture2D    PrevAdaptedLumTexture;
+SamplerState PrevAdaptedLumSampler;
+Texture2D    CurrentLumTexture;
+SamplerState CurrentLumSampler;
+
+float AdaptSpeedUp;   // Rate when scene gets brighter (luminance increasing)
+float AdaptSpeedDown; // Rate when scene gets darker (luminance decreasing)
+float DeltaTime;      // Frame time in seconds
+
+void LuminanceAdaptPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float prevLum = PrevAdaptedLumTexture.Load(int3(0, 0, 0)).r;
+	float currLum = CurrentLumTexture.Load(int3(0, 0, 0)).r;
+
+	// Select adaptation speed: faster for brightening, slower for darkening
+	float speed = (currLum > prevLum) ? AdaptSpeedUp : AdaptSpeedDown;
+
+	// Exponential moving average
+	float tau = 1.0 - exp(-speed * DeltaTime);
+
+	float adapted = prevLum + (currLum - prevLum) * tau;
+	adapted = max(adapted, 0.0001);
+
+	OutColor = float4(adapted, 0.0, 0.0, 1.0);
+}

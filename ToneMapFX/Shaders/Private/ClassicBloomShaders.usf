@@ -1,0 +1,50 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Simple brightness extraction shader
+// Extracts pixels above threshold for bloom
+
+// Parameters are bound from C++ SHADER_PARAMETER_STRUCT
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+float4 InputViewportSizeAndInvSize;
+float4 OutputViewportSizeAndInvSize;
+FScreenTransform SvPositionToInputTextureUV; // Transform from SvPosition to scene color texture UV
+float BloomThreshold;
+float BloomIntensity;
+
+void BrightPassPS(
+	float4 SvPosition : SV_POSITION,
+	out float4 OutColor : SV_Target0)
+{
+	// Use FScreenTransform to properly map SvPosition to scene color texture UV
+	// This handles all viewport offset and texture extent calculations correctly
+	float2 SceneColorUV = ApplyScreenTransform(SvPosition.xy, SvPositionToInputTextureUV);
+	
+	// Sample from full-resolution scene color
+	float4 SceneColor = Texture2DSample(SceneColorTexture, SceneColorSampler, SceneColorUV);
+	
+	// Calculate luminance (perceived brightness)
+	float Luminance = dot(SceneColor.rgb, float3(0.299, 0.587, 0.114));
+	
+	// Apply threshold with smooth falloff for natural bloom like old games
+	// Very low threshold (< 0.02) means we're in soft focus mode - capture full scene
+	float BrightMask = 1.0;
+	
+	if (BloomThreshold >= 0.02)
+	{
+		// Normal bloom mode: extract only highlights above threshold
+		// Use smooth step for gradual transition (more natural than hard cutoff)
+		float ThresholdMin = BloomThreshold;
+		float ThresholdMax = BloomThreshold + 0.5; // Smooth transition zone
+		BrightMask = smoothstep(ThresholdMin, ThresholdMax, Luminance);
+	}
+	
+	// Output extracted brightness
+	// Keep color information intact for better bloom quality
+	OutColor.rgb = SceneColor.rgb * BrightMask;
+	OutColor.a = 1.0;
+}

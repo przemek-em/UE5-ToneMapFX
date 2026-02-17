@@ -1,0 +1,229 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+// ============================================================================
+// Kawase Bloom - Progressive Pyramid Blur
+// Based on Masaki Kawase's GDC 2003 presentation "Frame Buffer Postprocessing 
+// Effects in DOUBLE-S.T.E.A.L (Wreckless)"
+// This is the authentic bloom technique used by many games from the mid-2000s era.
+// ============================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// ============================================================================
+// Shader Parameters
+// ============================================================================
+Texture2D SourceTexture;
+SamplerState SourceSampler;
+float4 SourceSizeAndInvSize; // Source texture size (for sampling offsets in downsample)
+float4 OutputSizeAndInvSize; // Output/destination size (for UV calculation from SvPosition)
+FScreenTransform SvPositionToSourceUV; // Transform SvPosition to source texture UV (handles viewport offsets)
+float BloomThreshold;
+float ThresholdKnee;
+int MipLevel;
+int bUseKarisAverage;
+
+// For upsample shader
+Texture2D PreviousMipTexture;
+float FilterRadius;
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+// Convert sRGB to linear (approximate)
+float3 ToLinear(float3 col)
+{
+    return pow(max(col, 0.0001), 2.2);
+}
+
+// Convert linear to sRGB (approximate)
+float3 ToSRGB(float3 col)
+{
+    return pow(max(col, 0.0001), 1.0 / 2.2);
+}
+
+// Calculate luminance (standard Rec. 709 weights)
+// Named to avoid conflict with UE's built-in Luminance function
+float CalcLuma(float3 col)
+{
+    return dot(col, float3(0.2126, 0.7152, 0.0722));
+}
+
+// Karis average - reduces fireflies (very bright subpixels)
+// Formula: 1 / (1 + luma) where luma is calculated from sRGB
+float KarisWeight(float3 col)
+{
+    float luma = CalcLuma(ToSRGB(col)) * 0.25;
+    return 1.0 / (1.0 + luma);
+}
+
+// Soft threshold - creates smooth transition instead of hard cutoff
+// This is more physically accurate and avoids harsh artifacts
+float3 SoftThreshold(float3 color, float threshold, float knee)
+{
+    float brightness = max(max(color.r, color.g), color.b);
+    
+    // Calculate soft curve
+    float soft = brightness - threshold + knee;
+    soft = clamp(soft, 0.0, 2.0 * knee);
+    soft = soft * soft / (4.0 * knee + 0.00001);
+    
+    // Apply contribution
+    float contribution = max(soft, brightness - threshold);
+    contribution /= max(brightness, 0.00001);
+    
+    return color * contribution;
+}
+
+// ============================================================================
+// Downsample Shader (13-tap filter)
+// This filter was designed to eliminate pulsating artifacts and temporal 
+// stability issues that plague simpler downsampling approaches.
+// ============================================================================
+void KawaseDownsamplePS(
+    float4 SvPosition : SV_POSITION,
+    out float4 OutColor : SV_Target0)
+{
+    // Use FScreenTransform for proper UV calculation
+    // This handles cases where source texture has extent != viewport (e.g., SceneColor)
+    float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSourceUV);
+    // Texel offsets use SOURCE texture size - this is where we're sampling FROM
+    float2 TexelSize = SourceSizeAndInvSize.zw;
+    
+    // Offset for half-pixel accurate sampling
+    float x = TexelSize.x;
+    float y = TexelSize.y;
+    
+    // 13-tap sampling pattern (with bilinear filtering, samples 36 actual pixels):
+    // a - b - c
+    // - j - k -
+    // d - e - f
+    // - l - m -
+    // g - h - i
+    // ('e' is the current texel center)
+    
+    float3 a = Texture2DSample(SourceTexture, SourceSampler, UV + float2(-2*x,  2*y)).rgb;
+    float3 b = Texture2DSample(SourceTexture, SourceSampler, UV + float2(   0,  2*y)).rgb;
+    float3 c = Texture2DSample(SourceTexture, SourceSampler, UV + float2( 2*x,  2*y)).rgb;
+    
+    float3 d = Texture2DSample(SourceTexture, SourceSampler, UV + float2(-2*x,    0)).rgb;
+    float3 e = Texture2DSample(SourceTexture, SourceSampler, UV).rgb;
+    float3 f = Texture2DSample(SourceTexture, SourceSampler, UV + float2( 2*x,    0)).rgb;
+    
+    float3 g = Texture2DSample(SourceTexture, SourceSampler, UV + float2(-2*x, -2*y)).rgb;
+    float3 h = Texture2DSample(SourceTexture, SourceSampler, UV + float2(   0, -2*y)).rgb;
+    float3 i = Texture2DSample(SourceTexture, SourceSampler, UV + float2( 2*x, -2*y)).rgb;
+    
+    float3 j = Texture2DSample(SourceTexture, SourceSampler, UV + float2(  -x,    y)).rgb;
+    float3 k = Texture2DSample(SourceTexture, SourceSampler, UV + float2(   x,    y)).rgb;
+    float3 l = Texture2DSample(SourceTexture, SourceSampler, UV + float2(  -x,   -y)).rgb;
+    float3 m = Texture2DSample(SourceTexture, SourceSampler, UV + float2(   x,   -y)).rgb;
+    
+    float3 downsample;
+    
+    if (MipLevel == 0 && bUseKarisAverage > 0)
+    {
+        // First mip with Karis average to prevent fireflies
+        // Group samples into 5 regions and apply weighted Karis average
+        float3 group0 = (a + b + d + e) * 0.03125; // 0.125 / 4
+        float3 group1 = (b + c + e + f) * 0.03125;
+        float3 group2 = (d + e + g + h) * 0.03125;
+        float3 group3 = (e + f + h + i) * 0.03125;
+        float3 group4 = (j + k + l + m) * 0.125;   // 0.5 / 4
+        
+        group0 *= KarisWeight(group0);
+        group1 *= KarisWeight(group1);
+        group2 *= KarisWeight(group2);
+        group3 *= KarisWeight(group3);
+        group4 *= KarisWeight(group4);
+        
+        downsample = group0 + group1 + group2 + group3 + group4;
+    }
+    else
+    {
+        // Standard weighted distribution:
+        // 0.5 + 0.125 + 0.125 + 0.125 + 0.125 = 1
+        // a,b,d,e * 0.125 (corner + adjacent)
+        // b,c,e,f * 0.125
+        // d,e,g,h * 0.125
+        // e,f,h,i * 0.125
+        // j,k,l,m * 0.5 (center diamond)
+        downsample = e * 0.125;
+        downsample += (a + c + g + i) * 0.03125;
+        downsample += (b + d + f + h) * 0.0625;
+        downsample += (j + k + l + m) * 0.125;
+    }
+    
+    // Apply threshold only on first mip
+    if (MipLevel == 0 && BloomThreshold > 0.0)
+    {
+        if (ThresholdKnee > 0.0)
+        {
+            // Soft threshold (more natural)
+            downsample = SoftThreshold(downsample, BloomThreshold, BloomThreshold * ThresholdKnee);
+        }
+        else
+        {
+            // Hard threshold (classic style)
+            float brightness = max(max(downsample.r, downsample.g), downsample.b);
+            downsample *= step(BloomThreshold, brightness);
+        }
+    }
+    
+    // Prevent completely black pixels that cause artifacts during upsampling
+    downsample = max(downsample, 0.0001);
+    
+    OutColor = float4(downsample, 1.0);
+}
+
+// ============================================================================
+// Upsample Shader (9-tap tent filter)
+// Progressively upsamples and blurs, accumulating blur from smaller mips
+// Uses additive blending with the previous (larger) mip level
+// ============================================================================
+void KawaseUpsamplePS(
+    float4 SvPosition : SV_POSITION,
+    out float4 OutColor : SV_Target0)
+{
+    // UV is calculated from output (destination) size
+    float2 UV = SvPosition.xy * OutputSizeAndInvSize.zw;
+    
+    // Filter radius in texture coordinates
+    float x = FilterRadius;
+    float y = FilterRadius;
+    
+    // 9-tap tent filter pattern:
+    // a - b - c
+    // d - e - f
+    // g - h - i
+    // ('e' is the current texel)
+    
+    float3 a = Texture2DSample(SourceTexture, SourceSampler, UV + float2(-x,  y)).rgb;
+    float3 b = Texture2DSample(SourceTexture, SourceSampler, UV + float2( 0,  y)).rgb;
+    float3 c = Texture2DSample(SourceTexture, SourceSampler, UV + float2( x,  y)).rgb;
+    
+    float3 d = Texture2DSample(SourceTexture, SourceSampler, UV + float2(-x,  0)).rgb;
+    float3 e = Texture2DSample(SourceTexture, SourceSampler, UV).rgb;
+    float3 f = Texture2DSample(SourceTexture, SourceSampler, UV + float2( x,  0)).rgb;
+    
+    float3 g = Texture2DSample(SourceTexture, SourceSampler, UV + float2(-x, -y)).rgb;
+    float3 h = Texture2DSample(SourceTexture, SourceSampler, UV + float2( 0, -y)).rgb;
+    float3 i = Texture2DSample(SourceTexture, SourceSampler, UV + float2( x, -y)).rgb;
+    
+    // 3x3 tent filter weights:
+    //  1   | 1 2 1 |
+    // -- * | 2 4 2 |
+    // 16   | 1 2 1 |
+    float3 upsample = e * 4.0;
+    upsample += (b + d + f + h) * 2.0;
+    upsample += (a + c + g + i);
+    upsample *= 1.0 / 16.0;
+    
+    // Add contribution from the previous (larger) mip level
+    float3 previousMip = Texture2DSample(PreviousMipTexture, SourceSampler, UV).rgb;
+    
+    // Additive blend - this is what creates the characteristic bloom spread
+    OutColor = float4(previousMip + upsample, 1.0);
+}
