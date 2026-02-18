@@ -1,0 +1,97 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Lens Effects — Lenticular Halo
+//
+// Physically: the crystalline lens acts as a diffraction grating, dispersing
+// different wavelengths to different radii.  Blue/violet scatters closer to the
+// source (smaller radius), red scatters farther (larger radius).  This chromatic
+// dispersion is what gives the halo its characteristic iridescent ring color —
+// it is NOT a copy of the scene, but a spectrally separated scatter of bright sources.
+//
+// Implementation: gather approach.  For each output pixel Q, sample the bright-pass
+// texture at positions (Q + dir * R_channel) for each of the three wavelength bands.
+// Because R_R > R_G > R_B, each channel sees a different ring of sources, producing
+// the characteristic violet-inside / red-outside color gradient.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D    BrightPassTexture;
+SamplerState BrightPassSampler;
+FScreenTransform SvPositionToBrightPassUV;
+float4       BufferSizeAndInvSize;
+float        HaloRadius;    // nominal radius (UV units, e.g. 0.15)
+float        HaloThickness; // radial spread of each channel's Gaussian (UV units, e.g. 0.03)
+float        HaloIntensity;
+float3       HaloTint;
+
+// 32 angular directions — avoids polygon artefacts
+#define HALO_ANGULAR_SAMPLES 32
+// 5 radial sub-steps per channel — smooth Gaussian profile across ring thickness
+#define HALO_RADIAL_STEPS    5
+
+// Chromatic dispersion: how much the radius shifts per channel.
+// Red samples farthest out, blue closest in.
+// Offset is expressed as a fraction of HaloThickness.
+#define HALO_CHROMA_OFFSET   0.6
+
+void HaloRingPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutHalo : SV_Target0)
+{
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToBrightPassUV);
+
+	float aspectRatio = BufferSizeAndInvSize.x / max(BufferSizeAndInvSize.y, 1.0f);
+	float angStep     = 6.28318530f / float(HALO_ANGULAR_SAMPLES);
+
+	// Per-channel radii: blue < green < red (chromatic dispersion)
+	float chromaShift = HaloThickness * HALO_CHROMA_OFFSET;
+	float R_r = HaloRadius + chromaShift;
+	float R_g = HaloRadius;
+	float R_b = HaloRadius - chromaShift;
+
+	// Gaussian sigma across ring thickness — same for all channels
+	float sigma    = max(HaloThickness * 0.5f, 1e-5f);
+	float invSig2  = -0.5f / (sigma * sigma);
+	float halfThick = HaloThickness * 0.5f;
+
+	float3 accumR = 0.0f, accumG = 0.0f, accumB = 0.0f;
+	float  totalW = 0.0f;
+
+	LOOP
+	for (int a = 0; a < HALO_ANGULAR_SAMPLES; ++a)
+	{
+		float  theta = float(a) * angStep;
+		float2 dir   = float2(cos(theta) / aspectRatio, sin(theta));
+
+		UNROLL
+		for (int r = 0; r < HALO_RADIAL_STEPS; ++r)
+		{
+			float t = (float(r) / float(HALO_RADIAL_STEPS - 1)) * 2.0f - 1.0f; // [-1, 1]
+			float w = exp(t * t * invSig2);
+
+			// Each channel samples at its own chromatic radius
+			float3 cR = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uv + dir * (R_r + t * halfThick), 0).rgb;
+			float3 cG = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uv + dir * (R_g + t * halfThick), 0).rgb;
+			float3 cB = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uv + dir * (R_b + t * halfThick), 0).rgb;
+
+			// Extract only the relevant channel from each sample — we want R from red-radius,
+			// G from green-radius, B from blue-radius.  This is the dispersed contribution.
+			accumR += cR * w;
+			accumG += cG * w;
+			accumB += cB * w;
+			totalW += w;
+		}
+	}
+
+	float normScale = (totalW > 1e-6f) ? (1.0f / totalW) : 0.0f;
+
+	// Reconstruct dispersed color: take R channel from red-radius samples,
+	// G from green-radius, B from blue-radius.
+	float3 halo = float3(
+		accumR.r * normScale,
+		accumG.g * normScale,
+		accumB.b * normScale);
+
+	OutHalo = float4(halo * HaloIntensity * HaloTint, 1.0f);
+}

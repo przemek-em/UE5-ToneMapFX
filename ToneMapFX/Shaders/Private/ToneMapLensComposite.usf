@@ -1,0 +1,42 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Lens Effects — Composite: screen-blend corona and halo onto scene colour
+// screen blend: out = scene + effect * max(1 - scene, 0)  (HDR-safe additive)
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+Texture2D    CoronaTexture;
+SamplerState CoronaSampler;
+Texture2D    HaloTexture;
+SamplerState HaloSampler;
+FScreenTransform SvPositionToSceneColorUV;
+FScreenTransform SvPositionToLensUV;
+float        bEnableCorona;
+float        bEnableHalo;
+
+void LensCompositePS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uvScene = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float2 uvLens  = ApplyScreenTransform(SvPosition.xy, SvPositionToLensUV);
+
+	float3 result = Texture2DSample(SceneColorTexture, SceneColorSampler, uvScene).rgb;
+
+	if (bEnableCorona > 0.5f)
+	{
+		float3 corona = Texture2DSample(CoronaTexture, CoronaSampler, uvLens).rgb;
+		result = result + corona * max(1.0f - result, 0.0f);
+	}
+
+	if (bEnableHalo > 0.5f)
+	{
+		float3 halo = Texture2DSample(HaloTexture, HaloSampler, uvLens).rgb;
+		result = result + halo * max(1.0f - result, 0.0f);
+	}
+
+	OutColor = float4(result, 1.0f);
+}

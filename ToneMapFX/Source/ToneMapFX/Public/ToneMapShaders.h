@@ -68,12 +68,20 @@ public:
 		SHADER_PARAMETER(float, GlobalExposure)
 
 		// Film Curve params (ReplaceTonemap mode)
-		SHADER_PARAMETER(float, FilmCurveMode) // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd
+		SHADER_PARAMETER(float, FilmCurveMode) // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal
 		SHADER_PARAMETER(FVector4f, HableParams1) // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 		SHADER_PARAMETER(FVector4f, HableParams2) // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
 		SHADER_PARAMETER(float, ReinhardWhitePoint)
 		SHADER_PARAMETER(float, HDRSaturation)
 		SHADER_PARAMETER(FVector3f, HDRColorBalance)
+
+		// Pre-tone-mapped bypass (Durand / Fattal multi-pass operators)
+		// When bPreToneMapped > 0.5, ApplyFilmCurve is skipped and PreToneMappedTexture is
+		// composited directly.  All color-grading, sRGB conversion, dithering still run.
+		SHADER_PARAMETER(float, bPreToneMapped)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PreToneMappedTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, PreToneMappedSampler)
+		SHADER_PARAMETER(FScreenTransform, SvPositionToPreToneMappedUV)
 
 		// Auto-Exposure (ReplaceTonemap mode)
 		SHADER_PARAMETER(float, AutoExposureMode) // 0=None, 1=EngineDefault, 2=Krawczyk

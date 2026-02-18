@@ -4,6 +4,9 @@
 #include "ToneMapComponent.h"
 #include "ToneMapShaders.h"
 #include "ClassicBloomShaders.h"
+#include "ToneMapDurand.h"
+#include "ToneMapFattal.h"
+#include "ToneMapLensEffects.h"
 #include "SceneView.h"
 #include "SceneRendering.h"
 #include "ScreenPass.h"
@@ -926,6 +929,375 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	}
 
 	// =====================================================================
+	// Durand-Dorsey 2002 Bilateral Tone Mapping — pre-pass
+	// Runs before ToneMapProcess; sets bPreToneMapped so the film curve is skipped.
+	// =====================================================================
+	FRDGTextureRef PreToneMappedTexture = nullptr;
+	bool bPreToneMapped = false;
+
+	if (bIsReplaceTonemap && ActiveComp->FilmCurve == EToneMapFilmCurve::Durand)
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "ToneMapFX_Durand");
+
+		const FIntPoint WS = ViewportSize;
+		const FVector4f BilateralBufferSize((float)WS.X, (float)WS.Y, 1.0f / WS.X, 1.0f / WS.Y);
+
+		const FScreenPassTextureViewport DurandWorkVP(WS, FIntRect(0, 0, WS.X, WS.Y));
+		const FScreenPassTextureViewport SceneColorInputVP_D(
+			FIntPoint(SceneColor.Texture->Desc.Extent.X, SceneColor.Texture->Desc.Extent.Y),
+			SceneColorViewport.Rect);
+		const FScreenTransform DurandSceneColorUV = (
+			FScreenTransform::ChangeTextureBasisFromTo(DurandWorkVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+			FScreenTransform::ChangeTextureBasisFromTo(SceneColorInputVP_D, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+
+		// --- Pass 1: log-luminance ---
+		FRDGTextureRef LogLumTex = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapDurand.LogLum"));
+
+		{
+			auto* P1 = GraphBuilder.AllocParameters<FToneMapDurandLogLumPS::FParameters>();
+			P1->View = ViewInfo.ViewUniformBuffer;
+			P1->SceneColorTexture = SceneColor.Texture;
+			P1->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P1->SvPositionToSceneColorUV = DurandSceneColorUV;
+			P1->OneOverPreExposure = 1.0f / FMath::Max(ViewInfo.PreExposure, 0.001f);
+			P1->RenderTargets[0] = FRenderTargetBinding(LogLumTex, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapDurandLogLumPS> Shader1(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("DurandLogLum"), Shader1, P1, FIntRect(0, 0, WS.X, WS.Y));
+		}
+
+		// --- Pass 2a/2b: cross-bilateral filter (horizontal then vertical) ---
+		FRDGTextureRef BasePing = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapDurand.BasePing"));
+		FRDGTextureRef BasePong = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapDurand.BasePong"));
+
+		auto RunDurandBilateral = [&](FRDGTextureRef InLogLum, FRDGTextureRef GuideLogLum,
+		                              FRDGTextureRef OutTex, FVector2f Dir, const TCHAR* EventName)
+		{
+			auto* P2 = GraphBuilder.AllocParameters<FToneMapDurandBilateralPS::FParameters>();
+			P2->View = ViewInfo.ViewUniformBuffer;
+			P2->LogLumTexture = InLogLum;
+			P2->LogLumSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P2->GuideTexture  = GuideLogLum;
+			P2->GuideSampler  = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P2->BufferSizeAndInvSize = BilateralBufferSize;
+			P2->BlurDirection        = Dir;
+			P2->SpatialSigma         = ActiveComp->DurandSpatialSigma;
+			P2->RangeSigma           = ActiveComp->DurandRangeSigma;
+			P2->RenderTargets[0]     = FRenderTargetBinding(OutTex, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapDurandBilateralPS> Shader2(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				FRDGEventName(EventName), Shader2, P2, FIntRect(0, 0, WS.X, WS.Y));
+		};
+
+		RunDurandBilateral(LogLumTex, LogLumTex, BasePing, FVector2f(1.0f, 0.0f), TEXT("DurandBilateralH"));
+		RunDurandBilateral(BasePing,  LogLumTex, BasePong, FVector2f(0.0f, 1.0f), TEXT("DurandBilateralV"));
+
+		// --- Pass 3: reconstruct ---
+		FRDGTextureRef DurandResult = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_FloatRGBA, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapDurand.Result"));
+
+		{
+			auto* P3 = GraphBuilder.AllocParameters<FToneMapDurandReconstructPS::FParameters>();
+			P3->View = ViewInfo.ViewUniformBuffer;
+			P3->SceneColorTexture = SceneColor.Texture;
+			P3->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P3->LogLumTexture    = LogLumTex;
+			P3->LogLumSampler    = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P3->BaseLayerTexture = BasePong;
+			P3->BaseLayerSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P3->SvPositionToSceneColorUV = DurandSceneColorUV;
+			P3->BufferSizeAndInvSize   = BilateralBufferSize;
+			P3->OneOverPreExposure = 1.0f / FMath::Max(ViewInfo.PreExposure, 0.001f);
+			P3->BaseCompression    = ActiveComp->DurandBaseCompression;
+			P3->DetailBoost        = ActiveComp->DurandDetailBoost;
+			P3->RenderTargets[0]   = FRenderTargetBinding(DurandResult, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapDurandReconstructPS> Shader3(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("DurandReconstruct"), Shader3, P3, FIntRect(0, 0, WS.X, WS.Y));
+		}
+
+		PreToneMappedTexture = DurandResult;
+		bPreToneMapped = true;
+	}
+	// =====================================================================
+	// Fattal et al. 2002 Gradient-Domain Tone Mapping — pre-pass
+	//
+	// All passes run at full viewport resolution.  Seeding Jacobi with
+	// log(lum) ensures partial convergence produces a valid compression ratio:
+	//   ratio = exp(I_final - logLumIn)  →  < 1 on contrast edges (attenuated)
+	//                                       ≈ 1 in smooth areas (preserved)
+	// =====================================================================
+	else if (bIsReplaceTonemap && ActiveComp->FilmCurve == EToneMapFilmCurve::Fattal)
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "ToneMapFX_Fattal");
+
+		const FIntPoint WS = ViewportSize;
+		const FVector4f FattalBufferSize((float)WS.X, (float)WS.Y, 1.0f / WS.X, 1.0f / WS.Y);
+		const float     FattalOneOverPreExposure = 1.0f / FMath::Max(ViewInfo.PreExposure, 0.001f);
+
+		const FScreenPassTextureViewport FattalWorkVP(WS, FIntRect(0, 0, WS.X, WS.Y));
+		const FScreenPassTextureViewport SceneColorInputVP_F(
+			FIntPoint(SceneColor.Texture->Desc.Extent.X, SceneColor.Texture->Desc.Extent.Y),
+			SceneColorViewport.Rect);
+		const FScreenTransform FattalSceneColorUV = (
+			FScreenTransform::ChangeTextureBasisFromTo(FattalWorkVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+			FScreenTransform::ChangeTextureBasisFromTo(SceneColorInputVP_F, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+
+		// --- Pass 0: log-luminance (Jacobi seed) ---
+		FRDGTextureRef LogLumTex = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapFattal.LogLum"));
+		{
+			auto* Pl = GraphBuilder.AllocParameters<FToneMapFattalLogLumPS::FParameters>();
+			Pl->View = ViewInfo.ViewUniformBuffer;
+			Pl->SceneColorTexture = SceneColor.Texture;
+			Pl->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pl->SvPositionToSceneColorUV = FattalSceneColorUV;
+			Pl->OneOverPreExposure = FattalOneOverPreExposure;
+			Pl->RenderTargets[0] = FRenderTargetBinding(LogLumTex, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapFattalLogLumPS> ShaderL(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("FattalLogLum"), ShaderL, Pl, FIntRect(0, 0, WS.X, WS.Y));
+		}
+
+		// --- Pass 1: attenuated gradient field (Hx, Hy) ---
+		FRDGTextureRef GradientTex = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_G32R32F, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapFattal.Gradient"));
+		{
+			auto* Pg = GraphBuilder.AllocParameters<FToneMapFattalGradientPS::FParameters>();
+			Pg->View = ViewInfo.ViewUniformBuffer;
+			Pg->SceneColorTexture = SceneColor.Texture;
+			Pg->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pg->SvPositionToSceneColorUV = FattalSceneColorUV;
+			Pg->BufferSizeAndInvSize = FattalBufferSize;
+			Pg->OneOverPreExposure   = FattalOneOverPreExposure;
+			Pg->Alpha      = ActiveComp->FattalAlpha;
+			Pg->Beta       = ActiveComp->FattalBeta;
+			Pg->NoiseFloor = ActiveComp->FattalNoise;
+			Pg->RenderTargets[0] = FRenderTargetBinding(GradientTex, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapFattalGradientPS> ShaderG(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("FattalGradient"), ShaderG, Pg, FIntRect(0, 0, WS.X, WS.Y));
+		}
+
+		// --- Pass 2: divergence div(H) ---
+		FRDGTextureRef DivHTex = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapFattal.DivH"));
+		{
+			auto* Pd = GraphBuilder.AllocParameters<FToneMapFattalDivergencePS::FParameters>();
+			Pd->View = ViewInfo.ViewUniformBuffer;
+			Pd->GradientTexture = GradientTex;
+			Pd->GradientSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pd->BufferSizeAndInvSize = FattalBufferSize;
+			Pd->RenderTargets[0] = FRenderTargetBinding(DivHTex, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapFattalDivergencePS> ShaderD(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("FattalDivergence"), ShaderD, Pd, FIntRect(0, 0, WS.X, WS.Y));
+		}
+
+		// --- Pass 3: Jacobi Poisson solver (seeded with log-lum) ---
+		FRDGTextureRef JPing = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapFattal.JPing"));
+		FRDGTextureRef JPong = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_R32_FLOAT, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapFattal.JPong"));
+
+		FRDGTextureRef JCurrent = LogLumTex; // seed: logLum gives useful partial-convergence
+		const int32 FattalIters = FMath::Clamp(ActiveComp->FattalJacobiIterations, 1, 200);
+		for (int32 It = 0; It < FattalIters; ++It)
+		{
+			FRDGTextureRef JOut = (It % 2 == 0) ? JPing : JPong;
+			auto* Pj = GraphBuilder.AllocParameters<FToneMapFattalJacobiPS::FParameters>();
+			Pj->View = ViewInfo.ViewUniformBuffer;
+			Pj->CurrentITexture = JCurrent;
+			Pj->CurrentISampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pj->DivHTexture     = DivHTex;
+			Pj->DivHSampler     = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pj->BufferSizeAndInvSize = FattalBufferSize;
+			Pj->RenderTargets[0] = FRenderTargetBinding(JOut, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapFattalJacobiPS> ShaderJ(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("FattalJacobi"), ShaderJ, Pj, FIntRect(0, 0, WS.X, WS.Y));
+			JCurrent = JOut;
+		}
+
+		// --- Pass 4: reconstruct ---
+		FRDGTextureRef FattalResult = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(WS, PF_FloatRGBA, FClearValueBinding::None,
+			    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMapFattal.Result"));
+		{
+			auto* Pr = GraphBuilder.AllocParameters<FToneMapFattalReconstructPS::FParameters>();
+			Pr->View = ViewInfo.ViewUniformBuffer;
+			Pr->SceneColorTexture = SceneColor.Texture;
+			Pr->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pr->SolvedITexture    = JCurrent;
+			Pr->SolvedISampler    = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			Pr->SvPositionToSceneColorUV = FattalSceneColorUV;
+			Pr->BufferSizeAndInvSize     = FattalBufferSize;
+			Pr->OneOverPreExposure = FattalOneOverPreExposure;
+			Pr->OutputSaturation   = ActiveComp->FattalSaturation;
+			Pr->RenderTargets[0]   = FRenderTargetBinding(FattalResult, ERenderTargetLoadAction::ENoAction);
+			TShaderMapRef<FToneMapFattalReconstructPS> ShaderR(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("FattalReconstruct"), ShaderR, Pr, FIntRect(0, 0, WS.X, WS.Y));
+		}
+
+		PreToneMappedTexture = FattalResult;
+		bPreToneMapped = true;
+	}
+
+	// =====================================================================
+	// Lens Effects — Ciliary Corona and Lenticular Halo
+	// Runs after bloom composite; composites the effects onto current SceneColor.
+	// =====================================================================
+	{
+		const bool bRunLensEffects = ActiveComp->bEnableCiliaryCorona || ActiveComp->bEnableLenticularHalo;
+		if (bRunLensEffects)
+		{
+			RDG_EVENT_SCOPE(GraphBuilder, "ToneMapFX_LensEffects");
+
+			const FIntPoint WS = ViewportSize;
+			const FVector4f LensBufferSize((float)WS.X, (float)WS.Y, 1.0f / WS.X, 1.0f / WS.Y);
+
+			const FScreenPassTextureViewport LensWorkVP(WS, FIntRect(0, 0, WS.X, WS.Y));
+			const FScreenPassTextureViewport SceneColorInputVP_L(
+				FIntPoint(SceneColor.Texture->Desc.Extent.X, SceneColor.Texture->Desc.Extent.Y),
+				SceneColorViewport.Rect);
+			const FScreenTransform LensSceneColorUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(LensWorkVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(SceneColorInputVP_L, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+			const FScreenTransform LensBrightPassUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(LensWorkVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(LensWorkVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+
+			// Use the lower of the two thresholds for the shared bright-pass
+			const float BrightPassThreshold = (ActiveComp->bEnableCiliaryCorona && ActiveComp->bEnableLenticularHalo)
+				? FMath::Min(ActiveComp->CoronaThreshold, ActiveComp->HaloThreshold)
+				: (ActiveComp->bEnableCiliaryCorona ? ActiveComp->CoronaThreshold : ActiveComp->HaloThreshold);
+
+			FRDGTextureRef BrightPassTex = GraphBuilder.CreateTexture(
+				FRDGTextureDesc::Create2D(WS, PF_FloatRGBA, FClearValueBinding::None,
+				    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+				TEXT("ToneMapLens.BrightPass"));
+
+			{
+				auto* Pb = GraphBuilder.AllocParameters<FToneMapLensBrightPassPS::FParameters>();
+				Pb->View = ViewInfo.ViewUniformBuffer;
+				Pb->SceneColorTexture = SceneColor.Texture;
+				Pb->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				Pb->SvPositionToSceneColorUV = LensSceneColorUV;
+				Pb->Threshold = BrightPassThreshold;
+				Pb->RenderTargets[0] = FRenderTargetBinding(BrightPassTex, ERenderTargetLoadAction::ENoAction);
+				TShaderMapRef<FToneMapLensBrightPassPS> ShaderBP(ViewInfo.ShaderMap);
+				FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+					RDG_EVENT_NAME("LensBrightPass"), ShaderBP, Pb, FIntRect(0, 0, WS.X, WS.Y));
+			}
+
+			FRDGTextureRef LensCoronaTex = SceneColor.Texture; // fallback
+			FRDGTextureRef LensHaloTex   = SceneColor.Texture; // fallback
+
+			// Corona streaks
+			if (ActiveComp->bEnableCiliaryCorona)
+			{
+				FRDGTextureRef CoronaOut = GraphBuilder.CreateTexture(
+					FRDGTextureDesc::Create2D(WS, PF_FloatRGBA, FClearValueBinding::None,
+					    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+					TEXT("ToneMapLens.Corona"));
+
+				auto* Pc = GraphBuilder.AllocParameters<FToneMapCoronaStreakPS::FParameters>();
+				Pc->View = ViewInfo.ViewUniformBuffer;
+				Pc->BrightPassTexture = BrightPassTex;
+				Pc->BrightPassSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				Pc->SvPositionToBrightPassUV = LensBrightPassUV;
+				Pc->BufferSizeAndInvSize = LensBufferSize;
+				Pc->SpikeCount           = ActiveComp->CoronaSpikeCount;
+				Pc->SpikeLength          = ActiveComp->CoronaSpikeLength;
+				Pc->CoronaIntensity      = ActiveComp->CoronaIntensity;
+				Pc->RenderTargets[0] = FRenderTargetBinding(CoronaOut, ERenderTargetLoadAction::ENoAction);
+				TShaderMapRef<FToneMapCoronaStreakPS> ShaderC(ViewInfo.ShaderMap);
+				FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+					RDG_EVENT_NAME("CoronaStreaks"), ShaderC, Pc, FIntRect(0, 0, WS.X, WS.Y));
+
+				LensCoronaTex = CoronaOut;
+			}
+
+			// Lenticular halo ring
+			if (ActiveComp->bEnableLenticularHalo)
+			{
+				FRDGTextureRef HaloOut = GraphBuilder.CreateTexture(
+					FRDGTextureDesc::Create2D(WS, PF_FloatRGBA, FClearValueBinding::None,
+					    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+					TEXT("ToneMapLens.Halo"));
+
+				auto* Ph = GraphBuilder.AllocParameters<FToneMapHaloRingPS::FParameters>();
+				Ph->View = ViewInfo.ViewUniformBuffer;
+				Ph->BrightPassTexture = BrightPassTex;
+				Ph->BrightPassSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				Ph->SvPositionToBrightPassUV = LensBrightPassUV;
+				Ph->BufferSizeAndInvSize = LensBufferSize;
+				Ph->HaloRadius    = ActiveComp->HaloRadius;
+				Ph->HaloThickness = ActiveComp->HaloThickness;
+				Ph->HaloIntensity = ActiveComp->HaloIntensity;
+				Ph->HaloTint      = FVector3f(ActiveComp->HaloTint.R, ActiveComp->HaloTint.G, ActiveComp->HaloTint.B);
+				Ph->RenderTargets[0] = FRenderTargetBinding(HaloOut, ERenderTargetLoadAction::ENoAction);
+				TShaderMapRef<FToneMapHaloRingPS> ShaderH(ViewInfo.ShaderMap);
+				FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+					RDG_EVENT_NAME("HaloRing"), ShaderH, Ph, FIntRect(0, 0, WS.X, WS.Y));
+
+				LensHaloTex = HaloOut;
+			}
+
+			// Composite lens effects onto scene color
+			FRDGTextureRef LensCompositeOut = GraphBuilder.CreateTexture(
+				FRDGTextureDesc::Create2D(WS, SceneColor.Texture->Desc.Format, FClearValueBinding::None,
+				    TexCreate_ShaderResource | TexCreate_RenderTargetable),
+				TEXT("ToneMapLens.Composite"));
+
+			{
+				auto* Plc = GraphBuilder.AllocParameters<FToneMapLensCompositePS::FParameters>();
+				Plc->View = ViewInfo.ViewUniformBuffer;
+				Plc->SceneColorTexture = SceneColor.Texture;
+				Plc->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				Plc->CoronaTexture     = LensCoronaTex;
+				Plc->CoronaSampler     = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				Plc->HaloTexture       = LensHaloTex;
+				Plc->HaloSampler       = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				Plc->SvPositionToSceneColorUV = LensSceneColorUV;
+				Plc->SvPositionToLensUV       = LensBrightPassUV;
+				Plc->bEnableCorona = ActiveComp->bEnableCiliaryCorona  ? 1.0f : 0.0f;
+				Plc->bEnableHalo   = ActiveComp->bEnableLenticularHalo ? 1.0f : 0.0f;
+				Plc->RenderTargets[0] = FRenderTargetBinding(LensCompositeOut, ERenderTargetLoadAction::ENoAction);
+				TShaderMapRef<FToneMapLensCompositePS> ShaderLC(ViewInfo.ShaderMap);
+				FPixelShaderUtils::AddFullscreenPass(GraphBuilder, ViewInfo.ShaderMap,
+					RDG_EVENT_NAME("LensEffectsComposite"), ShaderLC, Plc, FIntRect(0, 0, WS.X, WS.Y));
+			}
+
+			// Replace SceneColor so downstream ToneMapProcess sees the lens-composited image
+			SceneColor = FScreenPassTexture(LensCompositeOut, FIntRect(0, 0, WS.X, WS.Y));
+		}
+	}
+
+	// =====================================================================
 	// Determine output target
 	// =====================================================================
 
@@ -1049,6 +1421,29 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			ActiveComp->HDRColorBalance.R,
 			ActiveComp->HDRColorBalance.G,
 			ActiveComp->HDRColorBalance.B);
+
+		// ---- Pre-tone-mapped texture (Durand / Fattal bypass) ----
+		P->bPreToneMapped = bPreToneMapped ? 1.0f : 0.0f;
+		if (bPreToneMapped && PreToneMappedTexture)
+		{
+			P->PreToneMappedTexture = PreToneMappedTexture;
+			P->PreToneMappedSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+			// Pre-mapped texture lives in ViewportSize space with rect (0,0)→(W,H)
+			const FScreenPassTextureViewport PreTMVP(
+				FIntPoint(PreToneMappedTexture->Desc.Extent.X, PreToneMappedTexture->Desc.Extent.Y),
+				FIntRect(0, 0, PreToneMappedTexture->Desc.Extent.X, PreToneMappedTexture->Desc.Extent.Y));
+			P->SvPositionToPreToneMappedUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(PreTMVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+		}
+		else
+		{
+			// Fallback: provide valid texture to prevent RDG null-binding assert (won't be sampled)
+			P->PreToneMappedTexture = SceneColor.Texture;
+			P->PreToneMappedSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			P->SvPositionToPreToneMappedUV = P->SvPositionToSceneColorUV;
+		}
 
 		// --- White Balance ---
 		P->Temperature = ActiveComp->Temperature;

@@ -1,0 +1,53 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Durand & Dorsey 2002 — Pass 2: Cross-bilateral filter (1-D separable)
+// Run twice: horizontal (BlurDirection=(1,0)) then vertical (BlurDirection=(0,1))
+// Output: R32F filtered log-lum (base layer estimate)
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D    LogLumTexture;
+SamplerState LogLumSampler;
+Texture2D    GuideTexture;
+SamplerState GuideSampler;
+float4       BufferSizeAndInvSize;
+float2       BlurDirection;
+float        SpatialSigma;
+float        RangeSigma;
+
+#define BILATERAL_HALF_KERNEL 3
+
+void DurandBilateralPS(
+	float4 SvPosition : SV_Position,
+	out float OutBase : SV_Target0)
+{
+	float2 uv = SvPosition.xy * BufferSizeAndInvSize.zw;
+
+	float centerL    = Texture2DSampleLevel(LogLumTexture, LogLumSampler, uv, 0).r;
+	float invSigmaS2 = 0.5f / (SpatialSigma * SpatialSigma);
+	float invSigmaR2 = 0.5f / (RangeSigma   * RangeSigma);
+
+	int halfK = clamp((int)(BILATERAL_HALF_KERNEL * SpatialSigma + 0.5f), 1, 32);
+
+	float sumW = 0.0f;
+	float sumL = 0.0f;
+
+	LOOP
+	for (int i = -halfK; i <= halfK; ++i)
+	{
+		float2 sampleUV = uv + BlurDirection * (float(i) * BufferSizeAndInvSize.zw);
+		float  sampleL  = Texture2DSampleLevel(LogLumTexture, LogLumSampler, sampleUV, 0).r;
+		float  guideL   = Texture2DSampleLevel(GuideTexture,  GuideSampler,  sampleUV, 0).r;
+
+		float dSpatial = float(i);
+		float dRange   = centerL - guideL;
+		float w = exp(-dSpatial * dSpatial * invSigmaS2)
+		        * exp(-dRange   * dRange   * invSigmaR2);
+
+		sumW += w;
+		sumL += w * sampleL;
+	}
+
+	OutBase = sumL / max(sumW, 1e-8f);
+}

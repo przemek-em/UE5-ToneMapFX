@@ -1,0 +1,24 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Durand & Dorsey 2002 — Pass 1: Compute log10(luminance) map
+// Output: R32F  log10(lum + 1e-6)
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+float DurandLogLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float        OneOverPreExposure;
+
+void DurandLogLumPS(
+	float4 SvPosition : SV_Position,
+	out float OutLogLum : SV_Target0)
+{
+	float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 hdr = Texture2DSample(SceneColorTexture, SceneColorSampler, UV).rgb * OneOverPreExposure;
+	hdr = max(hdr, 0.0f);
+	OutLogLum = log10(max(DurandLogLuma(hdr), 1e-6f));
+}

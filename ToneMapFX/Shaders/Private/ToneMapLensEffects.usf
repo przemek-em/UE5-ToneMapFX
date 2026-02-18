@@ -1,0 +1,213 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+//
+// ToneMapLensEffects.usf — Ciliary corona streaks and lenticular halo ring
+//
+//  LensBrightPassPS — isolate super-threshold emissive pixels
+//  CoronaStreakPS   — accumulate radial spike arms along N directions
+//  HaloRingPS       — scatter an annular halo around bright sources
+//  LensCompositePS  — screen-blend corona and halo onto scene
+//
+// ==================================================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// --------------------------------------------------------------------------
+// Utility
+// --------------------------------------------------------------------------
+float LensLuma(float3 c)
+{
+	return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// ==================================================================================================
+// BRIGHT PASS — threshold the scene to isolate emissive / bright light sources
+//   Output: RGBA16F  (black below threshold, scene color above)
+// ==================================================================================================
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float        Threshold;
+
+void LensBrightPassPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 UV    = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float4 scene = Texture2DSample(SceneColorTexture, SceneColorSampler, UV);
+	float  lum   = LensLuma(scene.rgb);
+
+	// Soft threshold knee  (avoids hard edge artifact)
+	float knee = Threshold * 0.5f;
+	float weight = saturate((lum - Threshold + knee) / max(knee, 0.001f));
+
+	OutColor = float4(scene.rgb * weight, weight);
+}
+
+// ==================================================================================================
+// CORONA STREAK — directional star spikes from bright emitters
+//
+//  For each of SpikeCount arm directions θ_i = i * π / SpikeCount  (half-turn spacing
+//  so each direction covers both +θ and −θ, giving bilateral symmetry):
+//
+//    For step s = 1..SpikeLength:
+//      sample BrightPass at (uv ± step * dir_i)
+//      weight = Hann window * exp(-s/SpikeLength) — smooth falloff
+//      accumulate weighted colour
+//
+//  Total is normalised and scaled by CoronaIntensity.
+// ==================================================================================================
+Texture2D    BrightPassTexture;
+SamplerState BrightPassSampler;
+FScreenTransform SvPositionToBrightPassUV;
+float4       BufferSizeAndInvSize;
+int          SpikeCount;
+int          SpikeLength;
+float        CoronaIntensity;
+
+#define MAX_CORONA_SPIKES  16
+#define CORONA_STEP_MAX    200
+
+void CoronaStreakPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutCorona : SV_Target0)
+{
+	float2 centerUV = ApplyScreenTransform(SvPosition.xy, SvPositionToBrightPassUV);
+
+	float3 coronaAccum = 0.0f;
+	float  totalW = 0.0f;
+
+	// Half-turn spacing: SpikeCount arms, each covering ±direction
+	int halfSpikes = max(SpikeCount / 2, 1);
+	float invHalf = 3.14159265f / float(halfSpikes);
+
+	LOOP
+	for (int arm = 0; arm < halfSpikes && arm < MAX_CORONA_SPIKES; ++arm)
+	{
+		float theta = float(arm) * invHalf;
+		float2 dir  = float2(cos(theta), sin(theta)) * BufferSizeAndInvSize.zw;
+
+		LOOP
+		for (int s = 1; s <= SpikeLength && s <= CORONA_STEP_MAX; ++s)
+		{
+			float t = float(s) / float(SpikeLength);
+
+			// Hann-windowed exponential falloff: smooth near tip, zero at end
+			float hannW = 0.5f * (1.0f - cos(3.14159265f * (1.0f - t)));
+			float falloff = exp(-5.0f * t);   // fast fade
+			float w = hannW * falloff;
+
+			// Sample in both directions along arm
+			float3 cFwd = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler,
+			                                   centerUV + float(s) * dir, 0).rgb;
+			float3 cBwd = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler,
+			                                   centerUV - float(s) * dir, 0).rgb;
+
+			coronaAccum += (cFwd + cBwd) * w;
+			totalW += 2.0f * w;
+		}
+	}
+
+	float normScale = (totalW > 0.001f) ? (1.0f / totalW) : 0.0f;
+	OutCorona = float4(coronaAccum * normScale * CoronaIntensity, 1.0f);
+}
+
+// ==================================================================================================
+// HALO RING — lenticular scatter ring around bright sources
+//
+//  Fast annular convolution via difference of two blur radiussed ring blurs:
+//    haloContrib(p) = ∫ brightpass(q) * ring_weight(|p - q|) dq
+//
+//  Approximated here by sampling along a circle of radius HaloRadius centred
+//  on each bright source, using NRingSamples angular samples.
+//  Since we don't know source positions, we instead compute it as:
+//
+//    For each pixel p, accumulate from HaloRingSamples neighbours at distance
+//    HaloRadius, weighted by their brightness → forms a ring halo.
+//
+//  The number of angular samples is chosen to keep cost manageable.
+// ==================================================================================================
+float        HaloRadius;     // UV units  (e.g. 0.15)
+float        HaloThickness;  // UV units
+float        HaloIntensity;
+float3       HaloTint;       // colour modifier (pale blue by default)
+
+#define HALO_ANGULAR_SAMPLES 16
+
+void HaloRingPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutHalo : SV_Target0)
+{
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToBrightPassUV);
+
+	float3 haloAccum   = 0.0f;
+	float  totalW      = 0.0f;
+
+	float invN = 6.28318530f / float(HALO_ANGULAR_SAMPLES);
+
+	// Aspect correction: in pixel coordinates the screen is not square
+	// Use BufferSizeAndInvSize to express UV offsets in a roughly isotropic way.
+	float aspectRatio = BufferSizeAndInvSize.x / max(BufferSizeAndInvSize.y, 1.0f);
+
+	UNROLL
+	for (int i = 0; i < HALO_ANGULAR_SAMPLES; ++i)
+	{
+		float theta = float(i) * invN;
+		float2 dir  = float2(cos(theta) / aspectRatio, sin(theta));
+
+		// Sample the inner and outer edges of the ring band
+		float2 uvInner = uv + dir * (HaloRadius - HaloThickness * 0.5f);
+		float2 uvOuter = uv + dir * (HaloRadius + HaloThickness * 0.5f);
+
+		float3 cInner = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uvInner, 0).rgb;
+		float3 cOuter = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uvOuter, 0).rgb;
+
+		haloAccum += (cInner + cOuter) * 0.5f;
+		totalW    += 1.0f;
+	}
+
+	float normScale = (totalW > 0.001f) ? (1.0f / totalW) : 0.0f;
+	float3 halo = haloAccum * normScale * HaloIntensity * HaloTint;
+
+	OutHalo = float4(halo, 1.0f);
+}
+
+// ==================================================================================================
+// COMPOSITE — screen-blend lens effects onto scene colour
+//   Screen blend: out = scene + effect - scene * effect  (additive with clamping)
+//   This prevents the composite from exceed HDR white on an already bright scene.
+// ==================================================================================================
+Texture2D    CoronaTexture;
+SamplerState CoronaSampler;
+Texture2D    HaloTexture;
+SamplerState HaloSampler;
+FScreenTransform SvPositionToLensUV;
+float        bEnableCorona;
+float        bEnableHalo;
+
+void LensCompositePS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uvScene = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float2 uvLens  = ApplyScreenTransform(SvPosition.xy, SvPositionToLensUV);
+
+	float3 scene  = Texture2DSample(SceneColorTexture, SceneColorSampler, uvScene).rgb;
+	float3 result = scene;
+
+	if (bEnableCorona > 0.5f)
+	{
+		float3 corona = Texture2DSample(CoronaTexture, CoronaSampler, uvLens).rgb;
+		// Additive screen: avoid double-brightening already white areas
+		result = result + corona * max(1.0f - result, 0.0f);
+	}
+
+	if (bEnableHalo > 0.5f)
+	{
+		float3 halo = Texture2DSample(HaloTexture, HaloSampler, uvLens).rgb;
+		result = result + halo * max(1.0f - result, 0.0f);
+	}
+
+	OutColor = float4(result, 1.0f);
+}

@@ -1,0 +1,208 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+//
+// ToneMapFattal.usf — Fattal et al. 2002 gradient-domain high dynamic range compression
+//
+//  Pass 1  FattalGradientPS    — attenuated gradient field of log-luminance
+//  Pass 2  FattalDivergencePS  — divergence of the attenuated gradient field
+//  Pass 3  FattalJacobiPS      — Jacobi iterative Poisson solver  (run N times)
+//  Pass 4  FattalReconstructPS — reconstruct tone-mapped colour image
+//
+// References:
+//   R. Fattal, D. Lischinski & M. Werman, "Gradient Domain High Dynamic Range Compression",
+//   ACM SIGGRAPH 2002.
+// ==================================================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// --------------------------------------------------------------------------
+// Utility
+// --------------------------------------------------------------------------
+float FattalLuma(float3 c)
+{
+	return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// Natural-log helper (log base e, HSL for log10 = log(x)/log(10))
+#define LN10 2.302585093f
+
+// ==================================================================================================
+// PASS 1 — Attenuated gradient field  H = φ(x,y) * ∇(log L)
+//
+//  φ(x,y) = (α / |∇logL|)^β      [Fattal eq. 6]
+//  where |∇logL| is smoothed over a neighbourhood  (here we use central differences directly)
+//
+//  Output: RG32F → (Hx, Hy)
+// ==================================================================================================
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float4       BufferSizeAndInvSize;   // xy=size, zw=1/size  (of work textures)
+float        OneOverPreExposure;
+float        Alpha;
+float        Beta;
+float        NoiseFloor;
+
+void FattalGradientPS(
+	float4 SvPosition : SV_Position,
+	out float2 OutGrad : SV_Target0)   // (Hx, Hy)
+{
+	float2 uv  = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 off = BufferSizeAndInvSize.zw;
+
+	// Sample 3×3 neighbourhood for log-lum
+	// Compute central differences: forward/backward symmetric
+	float3 cC  = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv,                          0).rgb * OneOverPreExposure;
+	float3 cPX = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2( off.x, 0),      0).rgb * OneOverPreExposure;
+	float3 cMX = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2(-off.x, 0),      0).rgb * OneOverPreExposure;
+	float3 cPY = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2(0,  off.y),      0).rgb * OneOverPreExposure;
+	float3 cMY = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2(0, -off.y),      0).rgb * OneOverPreExposure;
+
+	float logC  = log(max(FattalLuma(cC),  1e-6f));
+	float logPX = log(max(FattalLuma(cPX), 1e-6f));
+	float logMX = log(max(FattalLuma(cMX), 1e-6f));
+	float logPY = log(max(FattalLuma(cPY), 1e-6f));
+	float logMY = log(max(FattalLuma(cMY), 1e-6f));
+
+	// Forward difference gradient  ∇logL  (in log units per pixel)
+	float dLdx = logPX - logC;
+	float dLdy = logPY - logC;
+
+	// Gradient magnitude (averaged between forward and backward to reduce aliasing)
+	float magFwd = sqrt(dLdx*dLdx + dLdy*dLdy + NoiseFloor*NoiseFloor);
+
+	// Smooth |∇logL| via Gaussian-of- neighbourhood (cheap: average forward+backward)
+	float dLdxBack = logC - logMX;
+	float dLdyBack = logC - logMY;
+	float magBack  = sqrt(dLdxBack*dLdxBack + dLdyBack*dLdyBack + NoiseFloor*NoiseFloor);
+	float mag      = 0.5f * (magFwd + magBack);
+
+	// Attenuation function φ = (α / GA)^β   where GA = mag / ln(10) (convert to decades)
+	// α is the "average gradient magnitude" proxy (user-controlled scale)
+	float GA   = max(mag, NoiseFloor) / LN10;   // convert to decades per pixel
+	float phi  = pow(Alpha / GA, Beta);
+
+	// Attenuated gradient
+	float Hx = phi * dLdx;
+	float Hy = phi * dLdy;
+
+	OutGrad = float2(Hx, Hy);
+}
+
+// ==================================================================================================
+// PASS 2 — Divergence  div(H) = ∂Hx/∂x + ∂Hy/∂y
+//
+//  Uses backward differences for numerical consistency with forward-difference gradients.
+//  Output: R32F divergence
+// ==================================================================================================
+Texture2D    GradientTexture;
+SamplerState GradientSampler;
+
+void FattalDivergencePS(
+	float4 SvPosition : SV_Position,
+	out float OutDiv : SV_Target0)
+{
+	float2 uv  = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 off = BufferSizeAndInvSize.zw;
+
+	float2 H_C  = Texture2DSampleLevel(GradientTexture, GradientSampler, uv,                     0).rg;
+	float2 H_MX = Texture2DSampleLevel(GradientTexture, GradientSampler, uv - float2(off.x, 0),  0).rg;
+	float2 H_MY = Texture2DSampleLevel(GradientTexture, GradientSampler, uv - float2(0, off.y),  0).rg;
+
+	// Backward divergence: ∂Hx/∂x ≈ (Hx_C - Hx_MX) / 1   (pixel units)
+	float divX = H_C.x - H_MX.x;
+	float divY = H_C.y - H_MY.y;
+
+	OutDiv = divX + divY;
+}
+
+// ==================================================================================================
+// PASS 3 — Jacobi Poisson solver  ∇²I = div(H)
+//
+//  One Jacobi iteration:
+//    I_new(x,y) = (I(x+1,y) + I(x-1,y) + I(x,y+1) + I(x,y-1) - divH(x,y)) / 4
+//
+//  This pass is dispatched N times ping-ponging between two R32F textures.
+//  Initialise CurrentITexture = DivHTexture / 4 (single pass bootstrap), or just zeros.
+// ==================================================================================================
+Texture2D    CurrentITexture;
+SamplerState CurrentISampler;
+Texture2D    DivHTexture;
+SamplerState DivHSampler;
+
+void FattalJacobiPS(
+	float4 SvPosition : SV_Position,
+	out float OutI : SV_Target0)
+{
+	float2 uv  = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 off = BufferSizeAndInvSize.zw;
+
+	float iPX = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2( off.x, 0),  0).r;
+	float iMX = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2(-off.x, 0),  0).r;
+	float iPY = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2(0,  off.y),  0).r;
+	float iMY = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2(0, -off.y),  0).r;
+
+	float divH = Texture2DSampleLevel(DivHTexture, DivHSampler, uv, 0).r;
+
+	OutI = (iPX + iMX + iPY + iMY - divH) * 0.25f;
+}
+
+// ==================================================================================================
+// PASS 4 — Reconstruct tone-mapped colour
+//
+//  The solved I field is the log-luminance of the output.
+//  We rescale it so that the scene mid-grey (0.18) maps to ~0.18 in output space.
+//
+//  Color reconstruction: scale RGB channels by (L_out / L_in)^OutputSaturation
+//   OutputSaturation = 1.0 → full chroma preserved
+//   OutputSaturation < 1 → partially desaturate to avoid over-saturation
+// ==================================================================================================
+Texture2D    SolvedITexture;
+SamplerState SolvedISampler;
+float        OutputSaturation;
+
+void FattalReconstructPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float2 uvGrid = SvPosition.xy * BufferSizeAndInvSize.zw;
+
+	float3 hdrColor  = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb * OneOverPreExposure;
+	hdrColor = max(hdrColor, 0.0f);
+
+	float  lumIn = max(FattalLuma(hdrColor), 1e-6f);
+	float  logLumIn = log(lumIn);             // natural log
+
+	// Read the solved I (also natural log space)
+	float I = Texture2DSampleLevel(SolvedITexture, SolvedISampler, uvGrid, 0).r;
+
+	// Bias so mid-grey (log(0.18)) maps to itself in output
+	// Simple: shift I by (log(0.18) - mean_of_I).
+	// We approximate by using the input-output relationship:
+	//   I_biased = I - logLumIn + log(lumIn_bias)   where lumIn_bias keeps 0.18 → 0.18
+	// Practical approach: just reconstruct and let the user adjust via Exposure slider.
+	// We apply a soft normalisation: scale so that the expected mid-key doesn't blow out.
+	const float kMidGrey = 0.18f;
+	float lumOut = exp(I - logLumIn + log(kMidGrey));  // rescale relative to input lum
+	lumOut = max(lumOut, 0.0f);
+
+	// Reconstruct: L_out / L_in ratio applied to saturation-blend
+	float  ratio   = lumOut / lumIn;
+	float3 result;
+	if (OutputSaturation >= 1.0f)
+	{
+		// Full chroma
+		result = hdrColor * ratio;
+	}
+	else
+	{
+		// Blend toward monochrome
+		float3 mono = float3(lumOut, lumOut, lumOut);
+		result = lerp(mono, hdrColor * ratio, OutputSaturation);
+	}
+
+	result = saturate(result);
+	OutColor = float4(result, 1.0f);
+}

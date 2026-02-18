@@ -1,0 +1,55 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Fattal et al. 2002 — Pass 1: Attenuated gradient field  H = φ(x,y) * ∇(log L)
+// φ(x,y) = (α / |∇logL|)^β      [Fattal eq. 6]
+// Output: RG32F → (Hx, Hy)
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+#define LN10 2.302585093f
+
+float FattalLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float4       BufferSizeAndInvSize;
+float        OneOverPreExposure;
+float        Alpha;
+float        Beta;
+float        NoiseFloor;
+
+void FattalGradientPS(
+	float4 SvPosition : SV_Position,
+	out float2 OutGrad : SV_Target0)
+{
+	float2 uv  = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float2 off = BufferSizeAndInvSize.zw;
+
+	float3 cC  = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv,                     0).rgb * OneOverPreExposure;
+	float3 cPX = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2( off.x, 0), 0).rgb * OneOverPreExposure;
+	float3 cMX = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2(-off.x, 0), 0).rgb * OneOverPreExposure;
+	float3 cPY = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2(0,  off.y), 0).rgb * OneOverPreExposure;
+	float3 cMY = Texture2DSampleLevel(SceneColorTexture, SceneColorSampler, uv + float2(0, -off.y), 0).rgb * OneOverPreExposure;
+
+	float logC  = log(max(FattalLuma(cC),  1e-6f));
+	float logPX = log(max(FattalLuma(cPX), 1e-6f));
+	float logMX = log(max(FattalLuma(cMX), 1e-6f));
+	float logPY = log(max(FattalLuma(cPY), 1e-6f));
+	float logMY = log(max(FattalLuma(cMY), 1e-6f));
+
+	float dLdx = logPX - logC;
+	float dLdy = logPY - logC;
+
+	float magFwd  = sqrt(dLdx*dLdx + dLdy*dLdy + NoiseFloor*NoiseFloor);
+	float dLdxBack = logC - logMX;
+	float dLdyBack = logC - logMY;
+	float magBack  = sqrt(dLdxBack*dLdxBack + dLdyBack*dLdyBack + NoiseFloor*NoiseFloor);
+	float mag      = 0.5f * (magFwd + magBack);
+
+	float GA  = max(mag, NoiseFloor) / LN10;
+	float phi = pow(Alpha / GA, Beta);
+
+	OutGrad = float2(phi * dLdx, phi * dLdy);
+}

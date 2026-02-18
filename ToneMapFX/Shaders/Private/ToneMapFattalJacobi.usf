@@ -1,0 +1,30 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Fattal et al. 2002 — Pass 3: Jacobi Poisson solver  ∇²I = div(H)
+// One Jacobi iteration: I_new = (I(x+1)+I(x-1)+I(x,y+1)+I(x,y-1) - divH) / 4
+// Dispatched N times ping-ponging two R32F targets.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D    CurrentITexture;
+SamplerState CurrentISampler;
+Texture2D    DivHTexture;
+SamplerState DivHSampler;
+float4       BufferSizeAndInvSize;
+
+void FattalJacobiPS(
+	float4 SvPosition : SV_Position,
+	out float OutI : SV_Target0)
+{
+	float2 uv  = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 off = BufferSizeAndInvSize.zw;
+
+	float iPX = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2( off.x, 0),  0).r;
+	float iMX = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2(-off.x, 0),  0).r;
+	float iPY = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2(0,  off.y),  0).r;
+	float iMY = Texture2DSampleLevel(CurrentITexture, CurrentISampler, uv + float2(0, -off.y),  0).r;
+	float divH = Texture2DSampleLevel(DivHTexture, DivHSampler, uv, 0).r;
+
+	OutI = (iPX + iMX + iPY + iMY - divH) * 0.25f;
+}

@@ -44,10 +44,17 @@ float GlobalExposure;
 // Hable Film Curve params (ReplaceTonemap mode)
 float4 HableParams1;   // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 float4 HableParams2;   // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
-float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd
+float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal
 float  ReinhardWhitePoint; // Extended Reinhard L_white
 float  HDRSaturation;
 float3 HDRColorBalance;
+
+// Pre-tone-mapped bypass (Durand / Fattal)
+// When bPreToneMapped > 0.5 the film curve is skipped; the pre-computed sRGB texture is used instead.
+float        bPreToneMapped;
+Texture2D    PreToneMappedTexture;
+SamplerState PreToneMappedSampler;
+FScreenTransform SvPositionToPreToneMappedUV;
 
 // Auto-Exposure (ReplaceTonemap mode)
 float AutoExposureMode;  // 0=None, 1=EngineDefault, 2=Krawczyk
@@ -829,7 +836,27 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 		color = max(color, 0.0);
 
 		// --- 14. Tonemapping (selected film curve) ---
-		color = ApplyFilmCurve(color, FilmCurveMode, HableParams1, HableParams2, ReinhardWhitePoint);
+		// When bPreToneMapped is set (Durand / Fattal), the tone-mapping was already
+		// performed in a preceding multi-pass stage and stored in PreToneMappedTexture.
+		// We sample that result directly (which is in [0,1] linear-light space, not yet
+		// sRGB) and skip ApplyFilmCurve.  All colour-grading above has already run on
+		// the HDR source colour, so we just inject the pre-mapped luminance here.
+		if (bPreToneMapped > 0.5)
+		{
+			float2 preTMUV = ApplyScreenTransform(SvPosition.xy, SvPositionToPreToneMappedUV);
+			float3 preTM   = Texture2DSample(PreToneMappedTexture, PreToneMappedSampler, preTMUV).rgb;
+			// Preserve colour-grading intent: scale pre-TM luminance by the ratio of
+			// colour-graded HDR relative to original HDR  (chrominance transfer).
+			float gradeScale = max(dot(color, float3(0.2126f, 0.7152f, 0.0722f)), 1e-6f)
+			                 / max(dot(originalColor * OneOverPreExposure * GlobalExposure,
+			                           float3(0.2126f, 0.7152f, 0.0722f)), 1e-6f);
+			color = preTM * gradeScale;
+			color = saturate(color);
+		}
+		else
+		{
+			color = ApplyFilmCurve(color, FilmCurveMode, HableParams1, HableParams2, ReinhardWhitePoint);
+		}
 
 		// --- 15. Parametric Tone Curve (fine-tuning, now in LDR 0-1) ---
 		if (bEnableCurves > 0.5)

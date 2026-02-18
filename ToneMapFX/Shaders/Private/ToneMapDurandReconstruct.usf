@@ -1,0 +1,52 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Durand & Dorsey 2002 — Pass 3: Reconstruction
+// detail = logLum - base;  outputLogLum = base*compression + detail*boost
+// Reconstruct linear RGB by scaling by L_out / L_in.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+float DurandReconLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+Texture2D    LogLumTexture;
+SamplerState LogLumSampler;
+Texture2D    BaseLayerTexture;
+SamplerState BaseLayerSampler;
+float4       BufferSizeAndInvSize;
+float        OneOverPreExposure;
+float        BaseCompression;
+float        DetailBoost;
+
+void DurandReconstructPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uvScene = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float2 uvWork  = SvPosition.xy * BufferSizeAndInvSize.zw;
+
+	float3 hdrColor = Texture2DSample(SceneColorTexture, SceneColorSampler, uvScene).rgb * OneOverPreExposure;
+	hdrColor = max(hdrColor, 0.0f);
+
+	float lumIn = max(DurandReconLuma(hdrColor), 1e-6f);
+	float logL  = log10(lumIn);
+
+	float base   = Texture2DSampleLevel(BaseLayerTexture, BaseLayerSampler, uvWork, 0).r;
+	float detail = logL - base;
+
+	float newLogL = base * BaseCompression + detail * DetailBoost;
+
+	// Anchor: when BaseCompression < 1 the base layer is scaled down, shifting the absolute
+	// level of logL.  Add kRef*(1 - BaseCompression) so mid-grey (base ≈ kRef, detail ≈ 0)
+	// maps exactly back to kRef in the output — preserving scene key without extra rescaling.
+	const float kTargetMidGrey = log10(0.18f); // ≈ -0.745
+	float outputLogL = newLogL + kTargetMidGrey * (1.0f - BaseCompression);
+
+	float lumOut = max(pow(10.0f, outputLogL), 0.0f);
+
+	float3 result = saturate(hdrColor * (lumOut / lumIn));
+	OutColor = float4(result, 1.0f);
+}

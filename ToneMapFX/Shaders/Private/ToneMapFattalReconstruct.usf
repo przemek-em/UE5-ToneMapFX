@@ -1,0 +1,56 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Fattal et al. 2002 — Pass 4: Reconstruct tone-mapped colour
+// Solved I field is the log-luminance of output.  Rescale to keep mid-grey at 0.18.
+// Color: scale RGB channels by (L_out/L_in)^OutputSaturation.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+float FattalReconLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+Texture2D    SolvedITexture;
+SamplerState SolvedISampler;
+float4       BufferSizeAndInvSize;
+float        OneOverPreExposure;
+float        OutputSaturation;
+
+void FattalReconstructPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uvScene = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	// uvGrid maps full-res SvPosition to [0,1] UV for sampling work-res textures
+	float2 uvGrid  = SvPosition.xy * BufferSizeAndInvSize.zw;
+
+	float3 hdrColor = Texture2DSample(SceneColorTexture, SceneColorSampler, uvScene).rgb * OneOverPreExposure;
+	hdrColor = max(hdrColor, 0.0f);
+
+	float lumIn    = max(FattalReconLuma(hdrColor), 1e-6f);
+	float logLumIn = log(lumIn);
+
+	// I was seeded with logLum at work-res and iterated toward the Poisson solution.
+	// After N Jacobi steps: I ≈ logLum_attenuated.
+	// ratio = exp(I - logLumIn): < 1 where large gradients were attenuated (compress),
+	//                            ≈ 1 in smooth areas (preserve), > 1 where shadows are lifted.
+	float I     = Texture2DSampleLevel(SolvedITexture, SolvedISampler, uvGrid, 0).r;
+	float ratio = exp(I - logLumIn);
+	ratio = clamp(ratio, 0.02f, 8.0f);  // safety: prevent black holes or blown highlights
+
+	float lumOut = lumIn * ratio;
+	float3 result;
+	if (OutputSaturation >= 1.0f)
+	{
+		result = hdrColor * ratio;
+	}
+	else
+	{
+		float3 mono = float3(lumOut, lumOut, lumOut);
+		result = lerp(mono, hdrColor * ratio, OutputSaturation);
+	}
+
+	OutColor = float4(saturate(result), 1.0f);
+}

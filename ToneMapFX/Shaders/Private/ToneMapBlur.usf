@@ -15,40 +15,41 @@ float        BlurRadius;             // spread multiplier (default 8)
 float4       SourceViewportRect;     // xy = Min, zw = Max (of source texture viewport)
 float4       SourceExtentInv;        // xy = 1/source extent, zw = unused
 
-// ---- 9-tap Gaussian weights (sigma ≈ 1.5) ----
-static const int   NUM_TAPS  = 5;
-static const float Weights[5] = { 0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216 };
+// Maximum half-kernel radius in texels (caps GPU work; 3*sigma covers 99.7% of Gaussian mass)
+#define BLUR_MAX_HALF_KERNEL 48
 
 void GaussianBlurPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
 {
 	// Map SvPosition (output texel coords) to source texture UV
-	// Normalize SvPosition in output space
-	float2 NormPos = SvPosition.xy * BufferSizeAndInvSize.zw;
-	// Map to source viewport texel position
+	float2 NormPos  = SvPosition.xy * BufferSizeAndInvSize.zw;
 	float2 TexelPos = lerp(SourceViewportRect.xy, SourceViewportRect.zw, NormPos);
-	// Convert to source texture UV
-	float2 UV = TexelPos * SourceExtentInv.xy;
+	float2 UV       = TexelPos * SourceExtentInv.xy;
 
-	// Texel size in source UV space
+	// Texel size in source UV space (1 texel step along blur direction)
 	float2 TexelSize = SourceExtentInv.xy;
 
-	// Epsilon for clamping to avoid sampling outside the texture
 	float2 Epsilon  = TexelSize * 0.5;
 	float2 ClampMin = Epsilon;
 	float2 ClampMax = 1.0 - Epsilon;
 
-	float2 SafeUV = clamp(UV, ClampMin, ClampMax);
-	float3 Result  = Texture2DSample(SourceTexture, SourceSampler, SafeUV).rgb * Weights[0];
+	// BlurRadius is the Gaussian sigma in texels.
+	// Sample at 1-texel intervals out to 3*sigma so every pixel contributes.
+	// This eliminates the aliasing/echo artefact caused by sparse (sigma-spaced) sampling.
+	float sigma    = max(BlurRadius, 0.5);
+	float invSig2  = -0.5 / (sigma * sigma);
+	int   halfK    = min(int(ceil(3.0 * sigma)), BLUR_MAX_HALF_KERNEL);
 
-	[unroll]
-	for (int i = 1; i < NUM_TAPS; i++)
+	float3 Result  = 0.0;
+	float  TotalW  = 0.0;
+
+	LOOP
+	for (int i = -halfK; i <= halfK; ++i)
 	{
-		float2 Offset  = BlurDirection * TexelSize * float(i) * BlurRadius;
-		float2 UVPlus  = clamp(UV + Offset, ClampMin, ClampMax);
-		float2 UVMinus = clamp(UV - Offset, ClampMin, ClampMax);
-		Result += Texture2DSample(SourceTexture, SourceSampler, UVPlus).rgb  * Weights[i];
-		Result += Texture2DSample(SourceTexture, SourceSampler, UVMinus).rgb * Weights[i];
+		float  w      = exp(float(i * i) * invSig2);
+		float2 SampleUV = clamp(UV + BlurDirection * TexelSize * float(i), ClampMin, ClampMax);
+		Result  += Texture2DSample(SourceTexture, SourceSampler, SampleUV).rgb * w;
+		TotalW  += w;
 	}
 
-	OutColor = float4(Result, 1.0);
+	OutColor = float4(Result / max(TotalW, 1e-6), 1.0);
 }

@@ -1,0 +1,56 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Lens Effects — Ciliary Corona: star spike streaks from bright emitters
+// Accumulates Hann-windowed radial samples along N/2 arm directions (each arm is bilateral).
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D    BrightPassTexture;
+SamplerState BrightPassSampler;
+FScreenTransform SvPositionToBrightPassUV;
+float4       BufferSizeAndInvSize;
+int          SpikeCount;
+int          SpikeLength;
+float        CoronaIntensity;
+
+#define MAX_CORONA_SPIKES  16
+#define CORONA_STEP_MAX    200
+
+void CoronaStreakPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutCorona : SV_Target0)
+{
+	float2 centerUV = ApplyScreenTransform(SvPosition.xy, SvPositionToBrightPassUV);
+
+	float3 coronaAccum = 0.0f;
+	float  totalW = 0.0f;
+
+	int halfSpikes = max(SpikeCount / 2, 1);
+	float invHalf  = 3.14159265f / float(halfSpikes);
+
+	LOOP
+	for (int arm = 0; arm < halfSpikes && arm < MAX_CORONA_SPIKES; ++arm)
+	{
+		float theta = float(arm) * invHalf;
+		float2 dir  = float2(cos(theta), sin(theta)) * BufferSizeAndInvSize.zw;
+
+		LOOP
+		for (int s = 1; s <= SpikeLength && s <= CORONA_STEP_MAX; ++s)
+		{
+			float t      = float(s) / float(SpikeLength);
+			float hannW  = 0.5f * (1.0f - cos(3.14159265f * (1.0f - t)));
+			float falloff = exp(-5.0f * t);
+			float w      = hannW * falloff;
+
+			float3 cFwd = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, centerUV + float(s) * dir, 0).rgb;
+			float3 cBwd = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, centerUV - float(s) * dir, 0).rgb;
+
+			coronaAccum += (cFwd + cBwd) * w;
+			totalW += 2.0f * w;
+		}
+	}
+
+	float normScale = (totalW > 0.001f) ? (1.0f / totalW) : 0.0f;
+	OutCorona = float4(coronaAccum * normScale * CoronaIntensity, 1.0f);
+}

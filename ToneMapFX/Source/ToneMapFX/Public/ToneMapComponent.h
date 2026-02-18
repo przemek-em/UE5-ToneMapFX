@@ -79,7 +79,11 @@ enum class EToneMapFilmCurve : uint8
 	ReinhardJodie   UMETA(DisplayName = "Reinhard-Jodie",
 		ToolTip = "Hybrid: blends per-channel Reinhard with luminance Reinhard. Subtle desaturation in brights."),
 	ReinhardStandard UMETA(DisplayName = "Reinhard (Standard)",
-		ToolTip = "Classic Reinhard applied per RGB channel. Simple, tends to desaturate.")
+		ToolTip = "Classic Reinhard applied per RGB channel. Simple, tends to desaturate."),
+	Durand          UMETA(DisplayName = "Durand-Dorsey 2002 (Bilateral)",
+		ToolTip = "Durand & Dorsey 2002 bilateral tone mapping. Compresses scene contrast while preserving local detail across luminance edges. Multi-pass: log-lum → bilateral base layer → base compression + detail restore."),
+	Fattal          UMETA(DisplayName = "Fattal et al. 2002 (Gradient Domain)",
+		ToolTip = "Fattal et al. 2002 gradient-domain tone mapping. Attenuates large luminance gradients while preserving fine detail. Multi-pass: gradient attenuation → divergence → iterative Poisson solve → reconstruct.")
 };
 
 /** Auto-exposure mode used in ReplaceTonemap mode */
@@ -523,6 +527,146 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve",
 		meta=(EditCondition = "Mode == EToneMapMode::ReplaceTonemap"))
 	FLinearColor HDRColorBalance = FLinearColor(1.0f, 1.0f, 1.0f, 1.0f);
+
+	// =========================================================================
+	// Durand-Dorsey 2002 Bilateral Tone Mapping
+	// https://people.csail.mit.edu/fredo/PUBLI/Siggraph2002/DurandBilateral.pdf
+	// https://cs.brown.edu/courses/cs129/2012/lectures/18.pdf
+	// =========================================================================
+
+	/** Spatial sigma for the bilateral filter (pixels at half-res).
+	    Controls how far the filter reaches; larger = wider base-layer smoothing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Durand",
+		meta=(ClampMin = "2.0", ClampMax = "64.0", UIMin = "2.0", UIMax = "64.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Durand"))
+	float DurandSpatialSigma = 16.0f;
+
+	/** Range sigma for the bilateral filter (log-luminance units).
+	    Smaller = stronger edge-preservation; larger = more smoothing across edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Durand",
+		meta=(ClampMin = "0.05", ClampMax = "2.0", UIMin = "0.05", UIMax = "2.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Durand"))
+	float DurandRangeSigma = 0.35f;
+
+	/** Base layer compression factor.  Lower = more compression (wider dynamic range reduction). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Durand",
+		meta=(ClampMin = "0.1", ClampMax = "0.95", UIMin = "0.1", UIMax = "0.95",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Durand"))
+	float DurandBaseCompression = 0.5f;
+
+	/** Detail layer boost.  1.0 = no change. >1 = enhanced local contrast. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Durand",
+		meta=(ClampMin = "0.5", ClampMax = "2.0", UIMin = "0.5", UIMax = "2.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Durand"))
+	float DurandDetailBoost = 1.0f;
+
+	// =========================================================================
+	// Fattal et al. 2002 Gradient-Domain Tone Mapping - experimental, could cause visible artifacts - thresholds/quantization, viewport issue to fix later on.
+	// https://dl.acm.org/doi/10.1145/566654.566573
+	// =========================================================================
+
+	/** Alpha — controls how aggressively large gradients are attenuated.
+	    Typical range 0.01–0.5.  Lower = more compression of bright transitions. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Fattal",
+		meta=(ClampMin = "0.01", ClampMax = "0.5", UIMin = "0.01", UIMax = "0.5",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Fattal"))
+	float FattalAlpha = 0.1f;
+
+	/** Beta — the exponent for gradient attenuation (φ_s power).
+	    0.9 is a good starting point; lower = stronger attenuation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Fattal",
+		meta=(ClampMin = "0.5", ClampMax = "1.0", UIMin = "0.5", UIMax = "1.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Fattal"))
+	float FattalBeta = 0.9f;
+
+	/** Output saturation scale (applied to chrominance after tone mapping).
+	    1.0 = neutral, 0 = monochrome, >1 = boosted. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Fattal",
+		meta=(ClampMin = "0.0", ClampMax = "1.5", UIMin = "0.0", UIMax = "1.5",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Fattal"))
+	float FattalSaturation = 0.8f;
+
+	/** Small noise floor added to Hy/Hx gradients to prevent divide-by-zero.
+	    Rarely needs changing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Fattal",
+		meta=(ClampMin = "0.0", ClampMax = "0.01", UIMin = "0.0", UIMax = "0.01",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Fattal"))
+	float FattalNoise = 0.0001f;
+
+	/** Number of Jacobi solver iterations.  Seeding from log(lum) makes partial convergence
+	    useful — 30 iterations gives good results; 60+ is high quality.  Each iteration is
+	    one fullscreen pass so keep this reasonable for real-time use. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Fattal",
+		meta=(ClampMin = "4", ClampMax = "200", UIMin = "4", UIMax = "100",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::Fattal"))
+	int32 FattalJacobiIterations = 30;
+
+	// =========================================================================
+	// Lens Effects — Ciliary Corona & Lenticular Halo
+	// =========================================================================
+
+	/** Enable ciliary corona: bright-light spike streaks produced by light diffraction over
+	    the iris/lens boundary, forming a star-burst pattern around very bright sources. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects")
+	bool bEnableCiliaryCorona = false;
+
+	/** Overall brightness of the corona streaks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0",
+		      EditCondition = "bEnableCiliaryCorona"))
+	float CoronaIntensity = 0.5f;
+
+	/** Number of spike arms (must be even — rotational symmetry).  6 = hexagonal, 8 = octagonal. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "2", ClampMax = "16", UIMin = "2", UIMax = "12",
+		      EditCondition = "bEnableCiliaryCorona"))
+	int32 CoronaSpikeCount = 6;
+
+	/** Pixel length of each spike arm (at full resolution). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "10", ClampMax = "400", UIMin = "10", UIMax = "200",
+		      EditCondition = "bEnableCiliaryCorona"))
+	int32 CoronaSpikeLength = 80;
+
+	/** Minimum luminance for a pixel to emit corona streaks. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "5.0",
+		      EditCondition = "bEnableCiliaryCorona"))
+	float CoronaThreshold = 0.8f;
+
+	/** Enable lenticular halo: a faint tinted ring appearing around very bright sources due
+	    to scattering in the lens glass (Mie scattering / internal reflections). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects")
+	bool bEnableLenticularHalo = false;
+
+	/** Overall brightness of the halo ring. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0",
+		      EditCondition = "bEnableLenticularHalo"))
+	float HaloIntensity = 0.3f;
+
+	/** Radius of the halo ring center, in [0..1] UV-space units. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "0.01", ClampMax = "0.5", UIMin = "0.01", UIMax = "0.5",
+		      EditCondition = "bEnableLenticularHalo"))
+	float HaloRadius = 0.15f;
+
+	/** Thickness (radial width) of the halo ring in UV-space units. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "0.002", ClampMax = "0.1", UIMin = "0.002", UIMax = "0.1",
+		      EditCondition = "bEnableLenticularHalo"))
+	float HaloThickness = 0.03f;
+
+	/** Minimum source luminance that contributes to the halo. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "5.0",
+		      EditCondition = "bEnableLenticularHalo"))
+	float HaloThreshold = 0.9f;
+
+	/** Tint color for the halo ring.  Pale blue-white mimics real lens coatings. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+		meta=(EditCondition = "bEnableLenticularHalo"))
+	FLinearColor HaloTint = FLinearColor(0.85f, 0.90f, 1.0f, 1.0f);
 
 	// =========================================================================
 	// Bloom

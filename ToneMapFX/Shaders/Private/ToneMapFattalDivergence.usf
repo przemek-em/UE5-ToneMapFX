@@ -1,0 +1,26 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Fattal et al. 2002 — Pass 2: Divergence  div(H) = ∂Hx/∂x + ∂Hy/∂y
+// Uses backward differences for consistency with forward-difference gradients.
+// Output: R32F divergence
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D    GradientTexture;
+SamplerState GradientSampler;
+float4       BufferSizeAndInvSize;
+
+void FattalDivergencePS(
+	float4 SvPosition : SV_Position,
+	out float OutDiv : SV_Target0)
+{
+	float2 uv  = SvPosition.xy * BufferSizeAndInvSize.zw;
+	float2 off = BufferSizeAndInvSize.zw;
+
+	float2 H_C  = Texture2DSampleLevel(GradientTexture, GradientSampler, uv,                     0).rg;
+	float2 H_MX = Texture2DSampleLevel(GradientTexture, GradientSampler, uv - float2(off.x, 0),  0).rg;
+	float2 H_MY = Texture2DSampleLevel(GradientTexture, GradientSampler, uv - float2(0, off.y),  0).rg;
+
+	OutDiv = (H_C.x - H_MX.x) + (H_C.y - H_MY.y);
+}

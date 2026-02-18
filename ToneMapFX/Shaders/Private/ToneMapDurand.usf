@@ -1,0 +1,154 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+//
+// ToneMapDurand.usf — Durand & Dorsey 2002 bilateral tone mapping
+//
+//  Pass 1  DurandLogLumPS       — compute log10(luminance) map
+//  Pass 2  DurandBilateralPS    — edge-preserving (bilateral) blur of log-lum (H ×N)
+//  Pass 3  DurandReconstructPS  — base compress + detail recombine → sRGB output
+//
+// References:
+//   F. Durand & J. Dorsey, "Fast Bilateral Filtering for the Display of High-Dynamic-Range Images",
+//   ACM SIGGRAPH 2002.
+// ==================================================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// --------------------------------------------------------------------------
+// Utility: perceptual luminance from linear RGB
+// --------------------------------------------------------------------------
+float DurandLuma(float3 c)
+{
+	return dot(c, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+// ==================================================================================================
+// PASS 1 — Log Luminance
+//   Output: R32F  log10(lum + 1e-6)
+// ==================================================================================================
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float        OneOverPreExposure;
+
+void DurandLogLumPS(
+	float4 SvPosition : SV_Position,
+	out float OutLogLum : SV_Target0)
+{
+	float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 hdrColor = Texture2DSample(SceneColorTexture, SceneColorSampler, UV).rgb
+	                  * OneOverPreExposure;
+	hdrColor = max(hdrColor, 0.0f);
+	float  lum      = max(DurandLuma(hdrColor), 1e-6f);
+	OutLogLum = log10(lum);
+}
+
+// ==================================================================================================
+// PASS 2 — Bilateral filter (1-D separable pass, run twice: H then V)
+//   Input:  R32F log-lum,  R32F guide (same log-lum, un-changed)
+//   Output: R32F filtered log-lum (base layer estimate)
+//
+//   Weight = spatial_gauss * range_gauss
+//     spatial_gauss = exp(-d^2 / (2 * σ_s^2))
+//     range_gauss   = exp(-(L_center - L_sample)^2 / (2 * σ_r^2))
+// ==================================================================================================
+Texture2D    LogLumTexture;
+SamplerState LogLumSampler;
+Texture2D    GuideTexture;
+SamplerState GuideSampler;
+float4       BufferSizeAndInvSize;   // xy = size  zw = 1/size
+float2       BlurDirection;
+float        SpatialSigma;
+float        RangeSigma;
+
+#define BILATERAL_HALF_KERNEL 3   // ±3*σ_s clamped to 32 samples max
+
+void DurandBilateralPS(
+	float4 SvPosition : SV_Position,
+	out float OutBase : SV_Target0)
+{
+	float2 uv = SvPosition.xy * BufferSizeAndInvSize.zw;
+
+	float centerL = Texture2DSampleLevel(LogLumTexture, LogLumSampler, uv, 0).r;
+
+	float invSigmaS2 = 0.5f / (SpatialSigma * SpatialSigma);
+	float invSigmaR2 = 0.5f / (RangeSigma   * RangeSigma);
+
+	// Clamp kernel half-width to 3*sigma, max 32 samples
+	int halfK = clamp((int)(BILATERAL_HALF_KERNEL * SpatialSigma + 0.5f), 1, 32);
+
+	float sumW = 0.0f;
+	float sumL = 0.0f;
+
+	LOOP
+	for (int i = -halfK; i <= halfK; ++i)
+	{
+		float2 offset = BlurDirection * (float(i) * BufferSizeAndInvSize.zw);
+		float2 sampleUV = uv + offset;
+		float  sampleL  = Texture2DSampleLevel(LogLumTexture, LogLumSampler, sampleUV, 0).r;
+		float  guideL   = Texture2DSampleLevel(GuideTexture,  GuideSampler,  sampleUV, 0).r;
+
+		float dSpatial = float(i);
+		float dRange   = centerL - guideL;
+
+		float w = exp(-dSpatial * dSpatial * invSigmaS2)
+		        * exp(-dRange   * dRange   * invSigmaR2);
+
+		sumW += w;
+		sumL += w * sampleL;
+	}
+
+	OutBase = sumL / max(sumW, 1e-8f);
+}
+
+// ==================================================================================================
+// PASS 3 — Reconstruction
+//   detail    = logLum_original - baseLayer
+//   newLogLum = baseLayer * BaseCompression + detail * DetailBoost
+//   L_out     = 10^newLogLum
+//   color_out = original_color * (L_out / L_in)   (restores chrominance ratio)
+//
+//   Important: output is already in [0,1] tone-mapped space; ToneMapProcess.usf
+//   will skip ApplyFilmCurve when bPreToneMapped == 1, but still applies sRGB,
+//   dithering and all color-grading steps.
+// ==================================================================================================
+Texture2D    BaseLayerTexture;
+SamplerState BaseLayerSampler;
+float        BaseCompression;
+float        DetailBoost;
+
+void DurandReconstructPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+
+	float3 hdrColor = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb
+	                  * OneOverPreExposure;
+	hdrColor = max(hdrColor, 0.0f);
+
+	float lumIn = max(DurandLuma(hdrColor), 1e-6f);
+	float logL  = log10(lumIn);
+
+	// Sample base layer at same UV (already spatially matches)
+	float base   = Texture2DSampleLevel(BaseLayerTexture, BaseLayerSampler, uv, 0).r;
+	float detail = logL - base;
+
+	// Compress base, boost detail
+	float newLogL = base * BaseCompression + detail * DetailBoost;
+
+	// Compute a reasonable output-space offset so mid-grey stays at ~0.18
+	// by centering the base at log10(0.18) ≈ -0.745
+	const float kTargetMidGrey = log10(0.18f);
+	float outputLogL = newLogL + kTargetMidGrey - (base * BaseCompression + kTargetMidGrey * (1.0f - BaseCompression));
+
+	float lumOut = pow(10.0f, outputLogL);
+	lumOut = max(lumOut, 0.0f);
+
+	// Restore chrominance by scaling all channels by the new/old lum ratio
+	float3 result = hdrColor * (lumOut / lumIn);
+	result = saturate(result);
+
+	OutColor = float4(result, 1.0f);
+}

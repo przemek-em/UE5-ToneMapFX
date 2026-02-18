@@ -1,0 +1,26 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Lens Effects — Bright Pass: isolate super-threshold emissive pixels
+// Output: RGBA16F  (black below threshold, scene colour above, soft-kneed)
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+float LensBPLuma(float3 c) { return dot(c, float3(0.2126f, 0.7152f, 0.0722f)); }
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float        Threshold;
+
+void LensBrightPassPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 UV    = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float4 scene = Texture2DSample(SceneColorTexture, SceneColorSampler, UV);
+	float  lum   = LensBPLuma(scene.rgb);
+	float  knee  = Threshold * 0.5f;
+	float  weight = saturate((lum - Threshold + knee) / max(knee, 0.001f));
+	OutColor = float4(scene.rgb * weight, weight);
+}
