@@ -123,6 +123,18 @@ Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure 
 ```bat
 .\Engine\Build\BatchFiles\Build.bat UnrealEditor Win64 Development -Plugin="YourDriveLetter\UnrealEngine-5.6.1-release\Engine\Plugins\Experimental\ToneMapFX\ToneMapFX.uplugin"
 ```
+---
+
+## Roadmap
+
+- [ ] Bounding box - multiple postprocess actors, blending across them
+- [ ] Additional AgX tonemapper
+- [ ] Additional RGB curves
+- [ ] Vignette
+- [ ] Sharpen, additional mode for pixel radius
+- [ ] Texture overlay
+- [ ] Custom light shafts
+- [ ] LUT import
 
 ---
 
