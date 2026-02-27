@@ -135,6 +135,7 @@ Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure 
 - [ ] Texture overlay
 - [ ] Custom light shafts
 - [ ] LUT import
+- [ ] Bloom bugfixes
 
 ---
 
