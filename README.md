@@ -152,6 +152,7 @@ Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure 
 - [x] ~~Vignette~~ *(done — Circular/Square, 5 falloffs, texture mask)*
 - [x] ~~LUT import~~ *(done — 16³/32³/64³ LUT color grading)*
 - [x] ~~Bloom bugfixes~~ *(done — soft-knee threshold, MaxBrightness clamp, PF_FloatRGBA)*
+- [ ] Camera Exposure settings - fix values
 - [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves
 - [ ] Sharpen, additional mode for pixel radius
