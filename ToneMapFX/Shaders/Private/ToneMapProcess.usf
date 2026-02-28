@@ -44,10 +44,13 @@ float GlobalExposure;
 // Hable Film Curve params (ReplaceTonemap mode)
 float4 HableParams1;   // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 float4 HableParams2;   // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
-float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal
+float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX
 float  ReinhardWhitePoint; // Extended Reinhard L_white
 float  HDRSaturation;
 float3 HDRColorBalance;
+
+// AgX params (ReplaceTonemap mode, FilmCurve == AgX)
+float4 AgXParams; // x=MinEV, y=MaxEV, z=Look(0=None,1=Punchy,2=Golden), w=unused
 
 // Pre-tone-mapped bypass (Durand / Fattal)
 // When bPreToneMapped > 0.5 the film curve is skipped; the pre-computed sRGB texture is used instead.
@@ -113,11 +116,9 @@ float4 LumAdj2;
 // HSL range smoothing
 float HSLSmoothing;    // 0 = sharpest cutoff, 100 = smoothest feather
 
-// Feature toggles & debug
+// Feature toggles
 float bEnableHSL;
 float bEnableCurves;
-float BlendAmount;     // 0 = original, 1 = fully processed
-float bSplitScreen;    // left = original, right = processed
 
 // ============================================================================
 // Utility: Rec.709 luminance
@@ -652,6 +653,120 @@ float3 ReinhardJodie(float3 color, float Lw)
 }
 
 // ============================================================================
+// AgX Display Rendering Transform (Troy Sobotka)
+// https://github.com/sobotka/AgX
+// ============================================================================
+// Pipeline: Inset matrix → Log2 encoding → Sigmoid tone curve → Outset matrix → Look
+// The inset matrix compresses BT.709 gamut toward achromatic before the tone
+// curve, preventing hue shifts and preserving saturation through highlight rolloff.
+// ============================================================================
+
+// AgX 3x3 inset matrix (BT.709 → AgX log working space).
+// Compresses primaries toward the achromatic axis to reduce out-of-gamut hue
+// shifts when the per-channel sigmoid clips individual channels.
+static const float3x3 AgXInsetMatrix = float3x3(
+	0.842479062253094,  0.0423738568574042, 0.0423738568574042,
+	0.0784335999999992, 0.878468636469772,  0.0784335999999992,
+	0.0792237451477643, 0.0791661274605434, 0.879142973793104
+);
+
+// AgX 3x3 outset matrix (inverse of inset — AgX log → BT.709).
+static const float3x3 AgXOutsetMatrix = float3x3(
+	 1.19687900512017,   -0.0528968517574562, -0.0529716355144438,
+	-0.0980208811401368,  1.15190312990417,   -0.0980434066710036,
+	-0.0990297440797205, -0.0989611768448433,  1.15107367264116
+);
+
+// 6th-degree polynomial approximation of the AgX default contrast sigmoid.
+// Attempt to match the 1D LUT from the OCIO config by fitting a polynomial
+// in [0,1] log-encoded space.  Attempt to match the 1D LUT from the OCIO config.
+float3 AgXDefaultContrastApprox(float3 x)
+{
+	float3 x2 = x * x;
+	float3 x4 = x2 * x2;
+
+	return + 15.5     * x4 * x2
+	       - 40.14    * x4 * x
+	       + 31.96    * x4
+	       - 6.868    * x2 * x
+	       + 0.4298   * x2
+	       + 0.1191   * x
+	       - 0.00232;
+}
+
+// Core AgX rendering: inset → log2 → sigmoid → outset
+float3 AgXCore(float3 color, float minEV, float maxEV)
+{
+	// Step 1: Apply inset matrix (compress gamut toward achromatic)
+	color = mul(AgXInsetMatrix, color);
+
+	// Protect against negatives / zero before log
+	color = max(color, 1e-10);
+
+	// Step 2: Log2 encoding — map [2^minEV, 2^maxEV] → [0, 1]
+	color = log2(color);
+	color = (color - minEV) / (maxEV - minEV);
+	color = saturate(color);
+
+	// Step 3: Sigmoid tone curve (polynomial approximation)
+	color = AgXDefaultContrastApprox(color);
+
+	return color;
+}
+
+// AgX creative looks — applied in the AgX log space after the sigmoid,
+// before the outset matrix.
+float3 AgXLookPunchy(float3 color)
+{
+	// Increase saturation and contrast for a vivid, punchy look
+	float3 luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+	// Saturation boost (1.35×)
+	color = luma + 1.35 * (color - luma);
+	// Contrast via power curve around midpoint
+	color = pow(max(color, 0.0), 1.35);
+	return color;
+}
+
+float3 AgXLookGolden(float3 color)
+{
+	// Warm golden tint with gentle contrast
+	float3 luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+	// Mild saturation boost (1.15×)
+	color = luma + 1.15 * (color - luma);
+	// Golden tint: warm shadows, keep highlights clean
+	float3 goldTint = float3(1.06, 0.98, 0.89);
+	color *= lerp(goldTint, float3(1.0, 1.0, 1.0), saturate(luma));
+	// Gentle contrast lift
+	color = pow(max(color, 0.0), 1.10);
+	return color;
+}
+
+// Full AgX pipeline
+float3 AgXToneMap(float3 color, float4 agxParams)
+{
+	float minEV = agxParams.x;
+	float maxEV = agxParams.y;
+	float look  = agxParams.z;
+
+	// Core rendering
+	color = AgXCore(color, minEV, maxEV);
+
+	// Apply creative look (in sigmoid-encoded space)
+	if (look > 0.5 && look < 1.5)
+		color = AgXLookPunchy(color);
+	else if (look > 1.5)
+		color = AgXLookGolden(color);
+
+	// Step 4: Apply outset matrix (expand back to BT.709)
+	color = mul(AgXOutsetMatrix, color);
+
+	// Clamp — outset can produce small negatives
+	color = saturate(color);
+
+	return color;
+}
+
+// ============================================================================
 // Film Curve Selector — dispatches to the chosen tonemapping operator
 // ============================================================================
 
@@ -663,8 +778,13 @@ float3 ApplyFilmCurve(float3 color, float mode, float4 hableParams1, float4 habl
 		return ReinhardLuminance(color, reinhardWP);               // 1 = Reinhard Luminance
 	else if (mode < 2.5)
 		return ReinhardJodie(color, reinhardWP);                   // 2 = Reinhard-Jodie
-	else
+	else if (mode < 3.5)
 		return ReinhardStandard(color, reinhardWP);                // 3 = Reinhard Standard
+	// 4 = Durand, 5 = Fattal — handled by bPreToneMapped path
+	else if (mode > 5.5)
+		return AgXToneMap(color, AgXParams);                       // 6 = AgX
+	else
+		return ReinhardStandard(color, reinhardWP);                // fallback
 }
 
 // ============================================================================
@@ -953,40 +1073,6 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 
 		// Clamp to prevent negative values after all processing
 		color = max(color, 0.0);
-	}
-
-	// --- 10. Blend / Debug ---
-	if (bSplitScreen > 0.5)
-	{
-		// Left half = original, right half = processed
-		float normX = (SvPosition.x - OutputViewportRect.x) / (OutputViewportRect.z - OutputViewportRect.x);
-		if (bReplaceTonemap > 0.5)
-		{
-			// In replace mode, show original with simple Reinhard + sRGB for comparison
-			float3 origHDR = originalColor * OneOverPreExposure * GlobalExposure;
-			float3 origTM = origHDR / (origHDR + 1.0);
-			origTM = LinearToSRGB(origTM);
-			color = (normX < 0.5) ? origTM : color;
-		}
-		else
-		{
-			color = (normX < 0.5) ? originalColor : color;
-		}
-	}
-	else
-	{
-		if (bReplaceTonemap > 0.5)
-		{
-			// In replace mode, blend between simple Reinhard and our processing
-			float3 origHDR = originalColor * OneOverPreExposure * GlobalExposure;
-			float3 origTM = origHDR / (origHDR + 1.0);
-			origTM = LinearToSRGB(origTM);
-			color = lerp(origTM, color, BlendAmount);
-		}
-		else
-		{
-			color = lerp(originalColor, color, BlendAmount);
-		}
 	}
 
 	OutColor = float4(color, 1.0);

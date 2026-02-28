@@ -1,0 +1,85 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// ============================================================================
+// ToneMapFX — LUT (Color Grading Look-Up Table) pass
+//
+// Applies a standard Unreal Engine LUT texture as a final color grading step.
+// Supports all standard UE LUT resolutions:
+//   256×16  → 16³  (16  slices of 16×16)
+//   1024×32 → 32³  (32  slices of 32×32)
+//   4096×64 → 64³  (64  slices of 64×64)
+//
+// Input:  sRGB display-referred color (post-tonemap, post-sRGB gamma)
+// Output: LUT-graded sRGB color
+// ============================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Scene color input (output of ToneMapProcess)
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+
+// LUT texture and parameters
+Texture2D    LUTTexture;
+SamplerState LUTSampler;
+float LUTSize;        // cube dimension: 16, 32, or 64
+float InvLUTSize;     // 1.0 / LUTSize
+float LUTIntensity;   // 0 = bypass, 1 = full LUT
+
+// ============================================================================
+// 2D-unwrapped 3D texture sample
+//
+// Standard UE LUT layout: horizontal strip of LUTSize slices, each slice is
+// LUTSize × LUTSize pixels.  Total texture: (LUTSize² × LUTSize).
+//
+// UVW is in [0,1]³ — the blue channel selects the slice pair, interpolating
+// between two adjacent slices for trilinear quality.
+// ============================================================================
+float3 SampleUnwrappedLUT(float3 UVW)
+{
+	// Clamp to avoid bleeding at edges
+	UVW = saturate(UVW);
+
+	// Map to texel centers: [0,1] → [0.5/Size, (Size-0.5)/Size]
+	float3 scaled = UVW * (LUTSize - 1.0);
+
+	// Blue axis: find two adjacent slices
+	float sliceF = scaled.z;
+	float slice0 = floor(sliceF);
+	float slice1 = min(slice0 + 1.0, LUTSize - 1.0);
+	float fracZ  = sliceF - slice0;
+
+	// Red axis mapped to horizontal position within a slice
+	float u0 = (slice0 * LUTSize + scaled.x + 0.5) * InvLUTSize * InvLUTSize;
+	float u1 = (slice1 * LUTSize + scaled.x + 0.5) * InvLUTSize * InvLUTSize;
+
+	// Green axis mapped to vertical
+	float v = (scaled.y + 0.5) * InvLUTSize;
+
+	float3 s0 = Texture2DSampleLevel(LUTTexture, LUTSampler, float2(u0, v), 0).rgb;
+	float3 s1 = Texture2DSampleLevel(LUTTexture, LUTSampler, float2(u1, v), 0).rgb;
+
+	return lerp(s0, s1, fracZ);
+}
+
+// ============================================================================
+// Main LUT pixel shader
+// ============================================================================
+void LUTPS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uv    = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 scene = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb;
+
+	// LUT lookup — scene is in sRGB gamma space, which is the standard domain
+	// for color-grading LUTs.  The RGB values [0,1] map directly to LUT UVW.
+	float3 lutColor = SampleUnwrappedLUT(scene);
+
+	// Blend between original and LUT-graded based on intensity
+	float3 result = lerp(scene, lutColor, LUTIntensity);
+
+	OutColor = float4(result, 1.0);
+}

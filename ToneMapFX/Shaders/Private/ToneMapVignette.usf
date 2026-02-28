@@ -1,0 +1,179 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// ToneMapFX — Vignette effect
+// Modes: Circular (Euclidean distance) or Square (Chebyshev distance)
+// Supports signed intensity (darken / lighten) and optional alpha mask texture
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Scene color input (output of ToneMapProcess)
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+
+// Vignette parameters
+// x = Mode     (0 = Circular, 1 = Square)
+// y = Size     (0..100, clear-zone radius from center)
+// z = Intensity (-100..100, positive = darken edges, negative = lighten edges)
+// w = FalloffMode (0=Linear, 1=Smooth, 2=Soft, 3=Hard, 4=Custom)
+float4 VignetteParams;
+float  FalloffExponent;  // power curve exponent (Custom mode)
+
+// ── Falloff curve helper ────────────────────────────────────────────
+// Takes a 0→1 linear ramp t and reshapes it.
+float ApplyFalloffCurve(float t, float falloffMode, float exponent)
+{
+	t = saturate(t);
+	if (falloffMode < 0.5)       // 0 = Linear
+		return t;
+	else if (falloffMode < 1.5)  // 1 = Smooth (smoothstep)
+		return t * t * (3.0 - 2.0 * t);
+	else if (falloffMode < 2.5)  // 2 = Soft (smootherstep / Ken Perlin)
+		return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+	else if (falloffMode < 3.5)  // 3 = Hard (sqrt)
+		return sqrt(t);
+	else                         // 4 = Custom power curve
+		return pow(t, exponent);
+}
+
+// ── Dither to break 8-bit banding ───────────────────────────────────
+// Interleaved gradient noise (Jimenez 2014)
+float InterleavedGradientNoise(float2 screenPos)
+{
+	float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+	return frac(magic.z * frac(dot(screenPos, magic.xy)));
+}
+
+// Alpha texture mask (optional)
+float  bUseAlphaTexture;    // > 0.5 = sample alpha texture
+float  bAlphaTextureOnly;   // > 0.5 = skip procedural vignette, use texture only
+float  TextureChannelIndex; // 0=Alpha, 1=Red, 2=Green, 3=Blue
+Texture2D    AlphaTexture;
+SamplerState AlphaSampler;
+
+void VignettePS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uv    = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 scene = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb;
+
+	float mode         = VignetteParams.x;
+	float sizeNorm     = VignetteParams.y / 100.0;  // 0..1
+	float rawIntensity = VignetteParams.z;           // -100..100
+	float falloffMode  = VignetteParams.w;           // 0-4
+	float absIntensity = abs(rawIntensity) / 100.0;  // 0..1
+	bool  bDarken      = (rawIntensity >= 0.0);
+
+	// Dither value: ±0.5/255 triangular noise to break banding
+	float noise = InterleavedGradientNoise(SvPosition.xy);
+	float dither = (noise - 0.5) / 255.0;
+
+	// ── Alpha texture sampling (channel-selectable) ────────────────────
+	float texAlpha = 1.0;
+	if (bUseAlphaTexture > 0.5)
+	{
+		float4 texSample = Texture2DSample(AlphaTexture, AlphaSampler, uv);
+		int ch = (int)TextureChannelIndex;
+		texAlpha = (ch == 1) ? texSample.r :
+		           (ch == 2) ? texSample.g :
+		           (ch == 3) ? texSample.b :
+		                       texSample.a;
+	}
+
+	// ── Alpha-texture-only mode ─────────────────────────────────────────
+	// Multiplies scene by the selected texture channel, with Intensity as strength.
+	// No procedural vignette geometry — purely texture-driven masking.
+	if (bAlphaTextureOnly > 0.5 && bUseAlphaTexture > 0.5)
+	{
+		if (bDarken)
+		{
+			// texAlpha 1 → no change, texAlpha 0 → darken to black
+			float factor = lerp(1.0, texAlpha, absIntensity);
+			OutColor = float4(scene * factor, 1.0);
+		}
+		else
+		{
+			// texAlpha 1 → no change, texAlpha 0 → lighten toward white
+			float3 result = lerp(scene, lerp(scene, 1.0, 1.0 - texAlpha), absIntensity);
+			OutColor = float4(result, 1.0);
+		}
+		return;
+	}
+
+	// ── Procedural vignette ─────────────────────────────────────────────
+	// Centered UV: [-1, 1] in both axes
+	float2 centered = (uv - 0.5) * 2.0;
+
+	float dist;
+	float maxDist;
+
+	if (mode < 0.5)
+	{
+		// Circular (Euclidean distance)
+		dist    = length(centered);
+		maxDist = 1.414;  // sqrt(2), corner distance
+	}
+	else
+	{
+		// Square — per-axis falloff avoids diagonal "pyramid" crease.
+		// Each edge fades independently; corners receive both contributions.
+		float2 absC   = abs(centered);
+		// Per-axis linear ramp, then apply falloff curve to each axis
+		float2 linRamp = saturate((absC - sizeNorm) / max(1.0 - sizeNorm, 0.001));
+		float2 edge    = float2(
+			ApplyFalloffCurve(linRamp.x, falloffMode, FalloffExponent),
+			ApplyFalloffCurve(linRamp.y, falloffMode, FalloffExponent));
+		// screen-blend union: 1 - (1-ex)(1-ey)
+		float sqMask  = 1.0 - (1.0 - edge.x) * (1.0 - edge.y);
+
+		// Combine with alpha texture
+		if (bUseAlphaTexture > 0.5)
+		{
+			sqMask = sqMask * (1.0 - texAlpha);
+		}
+
+		sqMask *= absIntensity;
+
+		float3 sqResult;
+		if (bDarken)
+		{
+			sqResult = scene * (1.0 - sqMask) + dither;
+		}
+		else
+		{
+			sqResult = scene + sqMask * (1.0 - scene) + dither;
+		}
+
+		OutColor = float4(sqResult, 1.0);
+		return;
+	}
+
+	// Clear-zone inner radius → full falloff at screen edge/corner
+	float inner   = sizeNorm * maxDist;
+	float linMask = saturate((dist - inner) / max(maxDist - inner, 0.001));
+	float mask    = ApplyFalloffCurve(linMask, falloffMode, FalloffExponent);
+
+	// Combine with alpha texture: dark texture areas increase vignette
+	if (bUseAlphaTexture > 0.5)
+	{
+		mask = mask * (1.0 - texAlpha);
+	}
+
+	mask *= absIntensity;
+
+	float3 result;
+	if (bDarken)
+	{
+		// Darken edges
+		result = scene * (1.0 - mask) + dither;
+	}
+	else
+	{
+		// Lighten edges (screen blend)
+		result = scene + mask * (1.0 - scene) + dither;
+	}
+
+	OutColor = float4(result, 1.0);
+}

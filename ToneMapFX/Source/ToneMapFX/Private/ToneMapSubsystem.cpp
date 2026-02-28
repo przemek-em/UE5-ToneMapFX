@@ -7,6 +7,8 @@
 #include "ToneMapDurand.h"
 #include "ToneMapFattal.h"
 #include "ToneMapLensEffects.h"
+#include "ToneMapVignetteShaders.h"
+#include "ToneMapLUTShaders.h"
 #include "SceneView.h"
 #include "SceneRendering.h"
 #include "ScreenPass.h"
@@ -57,6 +59,43 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 				InView.FinalPostProcessSettings.bOverride_BlueCorrection = 1;
 				InView.FinalPostProcessSettings.BlueCorrection = 0.0f;
 			}
+
+			// Disable UE's built-in bloom by zeroing its intensity
+			if (Ptr->bDisableUnrealBloom)
+			{
+				InView.FinalPostProcessSettings.bOverride_BloomIntensity = 1;
+				InView.FinalPostProcessSettings.BloomIntensity = 0.0f;
+			}
+
+			// Disable UE's built-in auto-exposure for Krawczyk and None modes.
+			// Engine Default intentionally keeps UE exposure active (user wants it).
+			//
+			// We neutralise every path that feeds into PreExposure:
+			//   AutoExposureMethod       → AEM_Manual   (no histogram/basic GPU pass)
+			//   AutoExposureBias         → 0            (pow(2, bias) scales PreExposure)
+			//   PhysicalCameraExposure   → false        (no ISO/aperture influence)
+			//   LocalExposure contrasts  → 1.0          (average feeds back into PreExposure)
+			const bool bNeedNeutralExposure = bCachedReplaceTonemap &&
+				Ptr->AutoExposureMode != EToneMapAutoExposure::EngineDefault;
+
+			if (bNeedNeutralExposure)
+			{
+				InView.FinalPostProcessSettings.bOverride_AutoExposureMethod = 1;
+				InView.FinalPostProcessSettings.AutoExposureMethod = AEM_Manual;
+
+				InView.FinalPostProcessSettings.bOverride_AutoExposureBias = 1;
+				InView.FinalPostProcessSettings.AutoExposureBias = 0.0f;
+
+				InView.FinalPostProcessSettings.bOverride_AutoExposureApplyPhysicalCameraExposure = 1;
+				InView.FinalPostProcessSettings.AutoExposureApplyPhysicalCameraExposure = false;
+
+				// Neutralise local exposure so its average doesn't feed back into PreExposure
+				InView.FinalPostProcessSettings.bOverride_LocalExposureHighlightContrastScale = 1;
+				InView.FinalPostProcessSettings.LocalExposureHighlightContrastScale = 1.0f;
+				InView.FinalPostProcessSettings.bOverride_LocalExposureShadowContrastScale = 1;
+				InView.FinalPostProcessSettings.LocalExposureShadowContrastScale = 1.0f;
+			}
+
 			break;
 		}
 	}
@@ -215,7 +254,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			{
 				FRDGTextureDesc BrightPassDesc = FRDGTextureDesc::Create2D(
 					DownsampledExtent,
-					PF_FloatR11G11B10,
+					PF_FloatRGBA,
 					FClearValueBinding::Black,
 					TexCreate_ShaderResource | TexCreate_RenderTargetable);
 
@@ -247,6 +286,8 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 						BPParams->BloomThreshold = EffectiveThreshold;
 						BPParams->BloomIntensity = 1.0f;
+						BPParams->ThresholdSoftness = FMath::Clamp(ActiveComp->BloomThresholdSoftness, 0.0f, 1.0f);
+						BPParams->MaxBrightness = FMath::Max(ActiveComp->BloomMaxBrightness, 0.0f);
 						BPParams->RenderTargets[0] = FRenderTargetBinding(BrightPassTexture, ERenderTargetLoadAction::EClear);
 
 						FPixelShaderUtils::AddFullscreenPass(
@@ -294,6 +335,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 							StreakParams->StreakDirection = Direction;
 							StreakParams->StreakLength = ScaledStreakLength;
 							StreakParams->StreakFalloff = Falloff;
+							StreakParams->StreakSamples = FMath::Clamp(ActiveComp->GlareSamples, 8, 64);
 							StreakParams->RenderTargets[0] = FRenderTargetBinding(StreakTexture, ERenderTargetLoadAction::EClear);
 
 							FPixelShaderUtils::AddFullscreenPass(
@@ -420,7 +462,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 							CurrentRect.Max.Y = FMath::Max(CurrentRect.Max.Y, 1);
 
 							FRDGTextureDesc MipDesc = FRDGTextureDesc::Create2D(
-								CurrentExtent, PF_FloatR11G11B10, FClearValueBinding::Black,
+								CurrentExtent, PF_FloatRGBA, FClearValueBinding::Black,
 								TexCreate_ShaderResource | TexCreate_RenderTargetable);
 
 							MipTextures.Add(GraphBuilder.CreateTexture(MipDesc, *FString::Printf(TEXT("ClassicBloom.KawaseMip%d"), Mip)));
@@ -471,7 +513,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 						for (int32 Mip = MipCount - 2; Mip >= 0; --Mip)
 						{
 							FRDGTextureDesc UpsampleDesc = FRDGTextureDesc::Create2D(
-								MipExtents[Mip], PF_FloatR11G11B10, FClearValueBinding::Black,
+								MipExtents[Mip], PF_FloatRGBA, FClearValueBinding::Black,
 								TexCreate_ShaderResource | TexCreate_RenderTargetable);
 							UpsampleTextures.Add(GraphBuilder.CreateTexture(UpsampleDesc, *FString::Printf(TEXT("ClassicBloom.KawaseUpsample%d"), Mip)));
 						}
@@ -1321,6 +1363,34 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	}
 
 	// =====================================================================
+	// Post-pass chain: LUT → Vignette (each redirects through intermediates)
+	// =====================================================================
+	const bool bNeedLUT = ActiveComp->bEnableLUT
+		&& ActiveComp->LUTTexture != nullptr
+		&& ActiveComp->LUTTexture->GetResource() != nullptr
+		&& ActiveComp->LUTTexture->GetResource()->TextureRHI != nullptr
+		&& ActiveComp->LUTIntensity > 0.001f;
+
+	const bool bNeedVignette = ActiveComp->bEnableVignette
+		&& FMath::Abs(ActiveComp->VignetteIntensity) > 0.01f;
+
+	FScreenPassRenderTarget FinalOutputTarget = OutputTarget;
+
+	// If any post-passes follow ToneMapProcess, redirect it to an intermediate
+	if (bNeedLUT || bNeedVignette)
+	{
+		OutputTarget = FScreenPassRenderTarget(
+			GraphBuilder.CreateTexture(
+				FRDGTextureDesc::Create2D(
+					ViewportSize, SceneColor.Texture->Desc.Format,
+					FClearValueBinding::None,
+					TexCreate_ShaderResource | TexCreate_RenderTargetable),
+				TEXT("ToneMap.PrePostPasses")),
+			FIntRect(0, 0, ViewportSize.X, ViewportSize.Y),
+			ERenderTargetLoadAction::ENoAction);
+	}
+
+	// =====================================================================
 	// Main Tone Map processing pass
 	// =====================================================================
 
@@ -1422,6 +1492,13 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			ActiveComp->HDRColorBalance.G,
 			ActiveComp->HDRColorBalance.B);
 
+		// ---- AgX params ----
+		P->AgXParams = FVector4f(
+			ActiveComp->AgXMinEV,
+			ActiveComp->AgXMaxEV,
+			(float)static_cast<uint8>(ActiveComp->AgXLook),
+			0.0f);
+
 		// ---- Pre-tone-mapped texture (Durand / Fattal bypass) ----
 		P->bPreToneMapped = bPreToneMapped ? 1.0f : 0.0f;
 		if (bPreToneMapped && PreToneMappedTexture)
@@ -1520,10 +1597,6 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		P->bEnableHSL    = ActiveComp->IsAnyHSLActive()   ? 1.0f : 0.0f;
 		P->bEnableCurves = ActiveComp->IsAnyCurveActive()  ? 1.0f : 0.0f;
 
-		// --- Debug ---
-		P->BlendAmount  = ActiveComp->BlendAmount;
-		P->bSplitScreen = ActiveComp->bSplitScreenComparison ? 1.0f : 0.0f;
-
 		P->RenderTargets[0] = FRenderTargetBinding(OutputTarget.Texture, OutputTarget.LoadAction);
 
 		TShaderMapRef<FToneMapProcessPS> ProcessShader(ViewInfo.ShaderMap);
@@ -1534,7 +1607,144 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			OutputTarget.ViewRect);
 	}
 
-	return FScreenPassTexture(OutputTarget.Texture, OutputTarget.ViewRect);
+	// =====================================================================
+	// LUT pass — runs after ToneMapProcess (post-tonemap, post-sRGB)
+	// =====================================================================
+	if (bNeedLUT)
+	{
+		// Determine LUT output target: another intermediate if vignette follows,
+		// otherwise write directly to FinalOutputTarget
+		FScreenPassRenderTarget LUTOutputTarget;
+		if (bNeedVignette)
+		{
+			LUTOutputTarget = FScreenPassRenderTarget(
+				GraphBuilder.CreateTexture(
+					FRDGTextureDesc::Create2D(
+						ViewportSize, SceneColor.Texture->Desc.Format,
+						FClearValueBinding::None,
+						TexCreate_ShaderResource | TexCreate_RenderTargetable),
+					TEXT("ToneMap.PreVignette")),
+				FIntRect(0, 0, ViewportSize.X, ViewportSize.Y),
+				ERenderTargetLoadAction::ENoAction);
+		}
+		else
+		{
+			LUTOutputTarget = FinalOutputTarget;
+		}
+
+		auto* LP = GraphBuilder.AllocParameters<FToneMapLUTPS::FParameters>();
+		LP->View              = ViewInfo.ViewUniformBuffer;
+		LP->SceneColorTexture = OutputTarget.Texture;  // ToneMapProcess output
+		LP->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+		// UV transform: SvPosition in LUTOutputTarget → UV in ToneMapProcess intermediate
+		const FIntPoint LUTOutExtent(LUTOutputTarget.Texture->Desc.Extent.X,
+		                             LUTOutputTarget.Texture->Desc.Extent.Y);
+		const FScreenPassTextureViewport LUTOutVP(LUTOutExtent, LUTOutputTarget.ViewRect);
+		const FScreenPassTextureViewport PreLUTVP(
+			ViewportSize, FIntRect(0, 0, ViewportSize.X, ViewportSize.Y));
+
+		LP->SvPositionToSceneColorUV = (
+			FScreenTransform::ChangeTextureBasisFromTo(LUTOutVP,
+				FScreenTransform::ETextureBasis::TexelPosition,
+				FScreenTransform::ETextureBasis::ViewportUV) *
+			FScreenTransform::ChangeTextureBasisFromTo(PreLUTVP,
+				FScreenTransform::ETextureBasis::ViewportUV,
+				FScreenTransform::ETextureBasis::TextureUV));
+
+		// LUT texture — detect dimensions to determine cube size
+		FRHITexture* LUTRHI = ActiveComp->LUTTexture->GetResource()->TextureRHI;
+		FRDGTextureRef LUTTex = GraphBuilder.RegisterExternalTexture(
+			CreateRenderTarget(LUTRHI, TEXT("ToneMapLUTTex")));
+		LP->LUTTexture = LUTTex;
+		LP->LUTSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+		// LUT cube dimension = texture height (256×16→16, 1024×32→32, 4096×64→64)
+		const float LUTSize = (float)LUTRHI->GetSizeXYZ().Y;
+		LP->LUTSize      = LUTSize;
+		LP->InvLUTSize    = 1.0f / FMath::Max(LUTSize, 1.0f);
+		LP->LUTIntensity  = ActiveComp->LUTIntensity;
+
+		LP->RenderTargets[0] = FRenderTargetBinding(LUTOutputTarget.Texture, LUTOutputTarget.LoadAction);
+
+		TShaderMapRef<FToneMapLUTPS> LUTShader(ViewInfo.ShaderMap);
+		FPixelShaderUtils::AddFullscreenPass(
+			GraphBuilder, ViewInfo.ShaderMap,
+			RDG_EVENT_NAME("ToneMapLUT"),
+			LUTShader, LP,
+			LUTOutputTarget.ViewRect);
+
+		// Update OutputTarget so the next pass (vignette) reads from LUT output
+		OutputTarget = LUTOutputTarget;
+	}
+
+	// =====================================================================
+	// Vignette pass — runs after LUT (or ToneMapProcess if no LUT)
+	// =====================================================================
+	if (bNeedVignette)
+	{
+		auto* VP = GraphBuilder.AllocParameters<FToneMapVignettePS::FParameters>();
+		VP->View              = ViewInfo.ViewUniformBuffer;
+		VP->SceneColorTexture = OutputTarget.Texture;  // LUT output (or ToneMapProcess if no LUT)
+		VP->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+		// UV transform: SvPosition in FinalOutputTarget → UV in previous pass intermediate
+		const FIntPoint FinalOutExtent(FinalOutputTarget.Texture->Desc.Extent.X,
+		                               FinalOutputTarget.Texture->Desc.Extent.Y);
+		const FScreenPassTextureViewport FinalOutVP(FinalOutExtent, FinalOutputTarget.ViewRect);
+		const FScreenPassTextureViewport PreVignetteVP(
+			ViewportSize, FIntRect(0, 0, ViewportSize.X, ViewportSize.Y));
+
+		VP->SvPositionToSceneColorUV = (
+			FScreenTransform::ChangeTextureBasisFromTo(FinalOutVP,
+				FScreenTransform::ETextureBasis::TexelPosition,
+				FScreenTransform::ETextureBasis::ViewportUV) *
+			FScreenTransform::ChangeTextureBasisFromTo(PreVignetteVP,
+				FScreenTransform::ETextureBasis::ViewportUV,
+				FScreenTransform::ETextureBasis::TextureUV));
+
+		// Vignette parameters: Mode, Size, Intensity
+		VP->VignetteParams = FVector4f(
+			(float)static_cast<uint8>(ActiveComp->VignetteMode),
+			ActiveComp->VignetteSize,
+			ActiveComp->VignetteIntensity,
+			(float)static_cast<uint8>(ActiveComp->VignetteFalloff));
+		VP->FalloffExponent = ActiveComp->VignetteFalloffExponent;
+
+		// Alpha texture (optional)
+		const bool bHasAlphaTex = ActiveComp->bVignetteUseAlphaTexture
+			&& ActiveComp->VignetteAlphaTexture != nullptr
+			&& ActiveComp->VignetteAlphaTexture->GetResource() != nullptr
+			&& ActiveComp->VignetteAlphaTexture->GetResource()->TextureRHI != nullptr;
+
+		VP->bUseAlphaTexture  = bHasAlphaTex ? 1.0f : 0.0f;
+		VP->bAlphaTextureOnly = (bHasAlphaTex && ActiveComp->bVignetteAlphaTextureOnly) ? 1.0f : 0.0f;
+		VP->TextureChannelIndex = (float)static_cast<uint8>(ActiveComp->VignetteTextureChannel);
+
+		if (bHasAlphaTex)
+		{
+			FRHITexture* AlphaRHI = ActiveComp->VignetteAlphaTexture->GetResource()->TextureRHI;
+			VP->AlphaTexture = GraphBuilder.RegisterExternalTexture(
+				CreateRenderTarget(AlphaRHI, TEXT("VignetteAlphaTex")));
+		}
+		else
+		{
+			// Safe fallback — won't be sampled when bUseAlphaTexture == 0
+			VP->AlphaTexture = OutputTarget.Texture;
+		}
+		VP->AlphaSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+		VP->RenderTargets[0] = FRenderTargetBinding(FinalOutputTarget.Texture, FinalOutputTarget.LoadAction);
+
+		TShaderMapRef<FToneMapVignettePS> VignetteShader(ViewInfo.ShaderMap);
+		FPixelShaderUtils::AddFullscreenPass(
+			GraphBuilder, ViewInfo.ShaderMap,
+			RDG_EVENT_NAME("ToneMapVignette"),
+			VignetteShader, VP,
+			FinalOutputTarget.ViewRect);
+	}
+
+	return FScreenPassTexture(FinalOutputTarget.Texture, FinalOutputTarget.ViewRect);
 }
 
 // =============================================================================

@@ -23,6 +23,8 @@ public:
 		SHADER_PARAMETER(FScreenTransform, SvPositionToInputTextureUV) // Transform SvPosition to scene color texture UV
 		SHADER_PARAMETER(float, BloomThreshold)
 		SHADER_PARAMETER(float, BloomIntensity)
+		SHADER_PARAMETER(float, ThresholdSoftness) // 0..1 — 0=hard cutoff, 1=very wide/soft knee
+		SHADER_PARAMETER(float, MaxBrightness)    // Clamp extreme HDR values (0=no clamp)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 
@@ -112,6 +114,7 @@ public:
 		SHADER_PARAMETER(FVector2f, StreakDirection) // Normalized direction vector
 		SHADER_PARAMETER(float, StreakLength) // Length in texels
 		SHADER_PARAMETER(float, StreakFalloff) // Exponential falloff rate
+		SHADER_PARAMETER(int32, StreakSamples) // Samples per direction (8/16/32/48/64)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 

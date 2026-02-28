@@ -14,9 +14,10 @@ float4 BufferSizeAndInvSize;
 float2 StreakDirection; // Normalized direction vector for this streak
 float StreakLength; // Length in texels
 float StreakFalloff; // Exponential falloff rate (higher = faster falloff)
+int StreakSamples; // Samples per direction (quality: 8=fast, 16=default, 32/48/64=high)
 
-// Number of samples along the streak (performance vs quality tradeoff)
-#define STREAK_SAMPLES 16
+// Hard upper bound so the compiler can allocate registers
+#define MAX_STREAK_SAMPLES 64
 
 void GlareStreakPS(
 	float4 SvPosition : SV_POSITION,
@@ -25,8 +26,10 @@ void GlareStreakPS(
 	float2 UV = SvPosition.xy * BufferSizeAndInvSize.zw;
 	float2 TexelSize = BufferSizeAndInvSize.zw;
 	
+	int NumSamples = clamp(StreakSamples, 4, MAX_STREAK_SAMPLES);
+	
 	// Sample step in texel space
-	float2 StepOffset = StreakDirection * TexelSize * (StreakLength / float(STREAK_SAMPLES));
+	float2 StepOffset = StreakDirection * TexelSize * (StreakLength / float(NumSamples));
 	
 	// Accumulate samples with exponential falloff in both directions
 	float3 Result = float3(0, 0, 0);
@@ -39,13 +42,15 @@ void GlareStreakPS(
 	TotalWeight += CenterWeight;
 	
 	// Sample along positive direction
-	UNROLL
-	for (int i = 1; i <= STREAK_SAMPLES; i++)
+	LOOP
+	for (int i = 1; i <= MAX_STREAK_SAMPLES; i++)
 	{
-		float Distance = float(i) / float(STREAK_SAMPLES);
+		if (i > NumSamples) break;
+		
+		float Distance = float(i) / float(NumSamples);
 		float Weight = exp(-Distance * StreakFalloff);
 		
-		if (Weight < 0.001) continue; // Skip negligible weights
+		if (Weight < 0.001) break; // Skip negligible weights
 		
 		float2 SampleUV = saturate(UV + StepOffset * float(i));
 		Result += Texture2DSample(SourceTexture, SourceSampler, SampleUV).rgb * Weight;
@@ -53,13 +58,15 @@ void GlareStreakPS(
 	}
 	
 	// Sample along negative direction
-	UNROLL
-	for (int j = 1; j <= STREAK_SAMPLES; j++)
+	LOOP
+	for (int j = 1; j <= MAX_STREAK_SAMPLES; j++)
 	{
-		float Distance = float(j) / float(STREAK_SAMPLES);
+		if (j > NumSamples) break;
+		
+		float Distance = float(j) / float(NumSamples);
 		float Weight = exp(-Distance * StreakFalloff);
 		
-		if (Weight < 0.001) continue; // Skip negligible weights
+		if (Weight < 0.001) break; // Skip negligible weights
 		
 		float2 SampleUV = saturate(UV - StepOffset * float(j));
 		Result += Texture2DSample(SourceTexture, SourceSampler, SampleUV).rgb * Weight;

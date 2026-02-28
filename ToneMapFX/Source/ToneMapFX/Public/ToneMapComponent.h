@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/SceneComponent.h"
+#include "Engine/Texture.h"
 #include "ToneMapComponent.generated.h"
 
 // ============================================================================
@@ -83,19 +84,81 @@ enum class EToneMapFilmCurve : uint8
 	Durand          UMETA(DisplayName = "Durand-Dorsey 2002 (Bilateral)",
 		ToolTip = "Durand & Dorsey 2002 bilateral tone mapping. Compresses scene contrast while preserving local detail across luminance edges. Multi-pass: log-lum → bilateral base layer → base compression + detail restore."),
 	Fattal          UMETA(DisplayName = "Fattal et al. 2002 (Gradient Domain)",
-		ToolTip = "Fattal et al. 2002 gradient-domain tone mapping. Attenuates large luminance gradients while preserving fine detail. Multi-pass: gradient attenuation → divergence → iterative Poisson solve → reconstruct.")
+		ToolTip = "Fattal et al. 2002 gradient-domain tone mapping. Attenuates large luminance gradients while preserving fine detail. Multi-pass: gradient attenuation → divergence → iterative Poisson solve → reconstruct."),
+	AgX             UMETA(DisplayName = "AgX (Sobotka)",
+		ToolTip = "AgX display rendering transform by Troy Sobotka. Inset matrix → log2 encoding → sigmoid tone curve → outset matrix. Preserves hue and saturation through highlight compression with minimal color clipping.")
 };
 
-/** Auto-exposure mode used in ReplaceTonemap mode */
+/** Creative look applied after the AgX base rendering */
+UENUM(BlueprintType)
+enum class EAgXLook : uint8
+{
+	None    UMETA(DisplayName = "None (Base AgX)",
+		ToolTip = "Pure AgX display rendering with no creative look applied."),
+	Punchy  UMETA(DisplayName = "Punchy",
+		ToolTip = "Increased contrast and saturation for a vivid, punchy look."),
+	Golden  UMETA(DisplayName = "Golden",
+		ToolTip = "Warm golden tint with gentle contrast — sunset/golden hour feel.")
+};
+
+/** Auto-exposure mode used in ReplaceTonemap mode.
+ *  Krawczyk and None automatically disable UE's built-in exposure system
+ *  (forces AEM_Manual with neutral EV) so that PreExposure is constant
+ *  and only ToneMapFX controls exposure.  Engine Default leaves UE's
+ *  eye-adaptation active and passes its exposure value through. */
 UENUM(BlueprintType)
 enum class EToneMapAutoExposure : uint8
 {
 	None            UMETA(DisplayName = "None (Manual Only)",
-		ToolTip = "No automatic exposure. Only the manual Exposure slider applies."),
+		ToolTip = "No automatic exposure — UE's built-in exposure is disabled. Only the manual Exposure slider applies."),
 	EngineDefault   UMETA(DisplayName = "Engine Default (UE Eye Adaptation)",
-		ToolTip = "Uses Unreal Engine's built-in eye adaptation (histogram or basic)."),
+		ToolTip = "Uses Unreal Engine's built-in eye adaptation (histogram or basic). UE's exposure system remains active."),
 	Krawczyk        UMETA(DisplayName = "Krawczyk (Automatic Scene Key)",
-		ToolTip = "Krawczyk et al. 2005: automatic scene key estimation from log-average luminance. Adapts exposure based on overall scene brightness.")
+		ToolTip = "(EXPERIMENTAL) Krawczyk et al. 2005: automatic scene key estimation from log-average luminance. UE's built-in exposure is disabled automatically.")
+};
+
+// ============================================================================
+// Vignette enums
+// ============================================================================
+
+/** Vignette shape mode */
+UENUM(BlueprintType)
+enum class EVignetteMode : uint8
+{
+	Circular UMETA(DisplayName = "Circular",
+		ToolTip = "Radial vignette using Euclidean distance from screen center. Slightly elliptical on widescreen — mirrors real lens behaviour."),
+	Square   UMETA(DisplayName = "Square",
+		ToolTip = "Square vignette using Chebyshev distance (max of X/Y offset). Uniform falloff toward each screen edge.")
+};
+
+/** Falloff curve shape for the vignette gradient */
+UENUM(BlueprintType)
+enum class EVignetteFalloff : uint8
+{
+	Linear   UMETA(DisplayName = "Linear",
+		ToolTip = "Simple linear ramp from clear zone to edge. No acceleration."),
+	Smooth   UMETA(DisplayName = "Smooth (Smoothstep)",
+		ToolTip = "Hermite S-curve (smoothstep). Gentle start and end with faster middle."),
+	Soft     UMETA(DisplayName = "Soft",
+		ToolTip = "Double-smoothstep (smootherstep). Very gradual, wide falloff — subtle, filmic."),
+	Hard     UMETA(DisplayName = "Hard",
+		ToolTip = "Square-root curve. Fast initial darkening, sharp visible boundary."),
+	Custom   UMETA(DisplayName = "Custom (Power Curve)",
+		ToolTip = "User-defined power exponent. <1 = hard edge, 1 = linear, >1 = soft/gradual.")
+};
+
+/** Which texture channel to read as the vignette mask value */
+UENUM(BlueprintType)
+enum class EVignetteTextureChannel : uint8
+{
+	Alpha UMETA(DisplayName = "Alpha (A)",
+		ToolTip = "Read the alpha channel. Use with RGBA textures that store the mask in A."),
+	Red   UMETA(DisplayName = "Red (R)",
+		ToolTip = "Read the red channel. Use with single-channel / grayscale textures."),
+	Green UMETA(DisplayName = "Green (G)",
+		ToolTip = "Read the green channel."),
+	Blue  UMETA(DisplayName = "Blue (B)",
+		ToolTip = "Read the blue channel.")
 };
 
 /**
@@ -171,7 +234,7 @@ public:
 	    Higher = wider, smoother overlap between regions. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone",
 		meta=(ClampMin = "0.0", ClampMax = "100.0", UIMin = "0.0", UIMax = "100.0"))
-	float ToneSmoothing = 50.0f;
+	float ToneSmoothing = 100.0f;
 
 	/** Contrast pivot point (linear luminance). Default 0.18 = photographic mid-grey.
 	    Lower values push the pivot into shadows, higher into highlights. */
@@ -261,7 +324,7 @@ public:
 	    Higher = smoother feathering (wider overlap between ranges). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|HSL",
 		meta=(ClampMin = "0.0", ClampMax = "100.0", UIMin = "0.0", UIMax = "100.0"))
-	float HSLSmoothing = 50.0f;
+	float HSLSmoothing = 100.0f;
 
 	// =========================================================================
 	// HSL — Hue (per-color hue rotation, -100 to 100)
@@ -602,69 +665,93 @@ public:
 	int32 FattalJacobiIterations = 30;
 
 	// =========================================================================
-	// Lens Effects — Ciliary Corona & Lenticular Halo
+	// AgX (Sobotka) Display Rendering Transform
+	// https://github.com/sobotka/AgX
+	// =========================================================================
+
+	/** Creative look applied after the AgX base curve. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|AgX",
+		meta=(EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::AgX"))
+	EAgXLook AgXLook = EAgXLook::None;
+
+	/** Minimum exposure (EV) for the log2 encoding range.
+	    Lower = captures more shadow detail. Default: -10.0. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|AgX",
+		meta=(ClampMin = "-20.0", ClampMax = "0.0", UIMin = "-15.0", UIMax = "-5.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::AgX"))
+	float AgXMinEV = -10.0f;
+
+	/** Maximum exposure (EV) for the log2 encoding range.
+	    Higher = more highlight headroom before clipping. Default: +6.5. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|AgX",
+		meta=(ClampMin = "0.0", ClampMax = "20.0", UIMin = "2.0", UIMax = "12.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::AgX"))
+	float AgXMaxEV = 6.5f;
+
+	// =========================================================================
+	// Additional Lens Effects — Ciliary Corona & Lenticular Halo
 	// =========================================================================
 
 	/** Enable ciliary corona: bright-light spike streaks produced by light diffraction over
 	    the iris/lens boundary, forming a star-burst pattern around very bright sources. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects")
 	bool bEnableCiliaryCorona = false;
 
 	/** Overall brightness of the corona streaks. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0",
 		      EditCondition = "bEnableCiliaryCorona"))
 	float CoronaIntensity = 0.5f;
 
 	/** Number of spike arms (must be even — rotational symmetry).  6 = hexagonal, 8 = octagonal. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "2", ClampMax = "16", UIMin = "2", UIMax = "12",
 		      EditCondition = "bEnableCiliaryCorona"))
 	int32 CoronaSpikeCount = 6;
 
 	/** Pixel length of each spike arm (at full resolution). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "10", ClampMax = "400", UIMin = "10", UIMax = "200",
 		      EditCondition = "bEnableCiliaryCorona"))
 	int32 CoronaSpikeLength = 80;
 
 	/** Minimum luminance for a pixel to emit corona streaks. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "5.0",
 		      EditCondition = "bEnableCiliaryCorona"))
 	float CoronaThreshold = 0.8f;
 
 	/** Enable lenticular halo: a faint tinted ring appearing around very bright sources due
 	    to scattering in the lens glass (Mie scattering / internal reflections). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects")
 	bool bEnableLenticularHalo = false;
 
 	/** Overall brightness of the halo ring. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0",
 		      EditCondition = "bEnableLenticularHalo"))
 	float HaloIntensity = 0.3f;
 
 	/** Radius of the halo ring center, in [0..1] UV-space units. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.01", ClampMax = "0.5", UIMin = "0.01", UIMax = "0.5",
 		      EditCondition = "bEnableLenticularHalo"))
 	float HaloRadius = 0.15f;
 
 	/** Thickness (radial width) of the halo ring in UV-space units. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.002", ClampMax = "0.1", UIMin = "0.002", UIMax = "0.1",
 		      EditCondition = "bEnableLenticularHalo"))
 	float HaloThickness = 0.03f;
 
 	/** Minimum source luminance that contributes to the halo. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "5.0",
 		      EditCondition = "bEnableLenticularHalo"))
 	float HaloThreshold = 0.9f;
 
 	/** Tint color for the halo ring.  Pale blue-white mimics real lens coatings. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Lens Effects",
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(EditCondition = "bEnableLenticularHalo"))
 	FLinearColor HaloTint = FLinearColor(0.85f, 0.90f, 1.0f, 1.0f);
 
@@ -691,6 +778,22 @@ public:
 		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "10.0",
 		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::SoftFocus"))
 	float BloomThreshold = 0.8f;
+
+	/** Softness of the bloom threshold edge (0 = hard cutoff, 1 = very wide soft knee).
+	 *  Higher values eliminate the visible 'cutoff circle' around very bright sources. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
+		meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0",
+		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::SoftFocus && BloomMode != EBloomMode::Kawase"))
+	float BloomThresholdSoftness = 0.5f;
+
+	/** Maximum HDR brightness fed into the bloom blur (0 = unlimited).
+	 *  Clamping extreme values prevents banding/quantization rings around
+	 *  very bright point sources like the sun or emissive meshes.
+	 *  Recommended: 5-20. Set to 0 to disable. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
+		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "100.0",
+		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::Kawase"))
+	float BloomMaxBrightness = 1.0f;
 
 	/** Size of the bloom effect */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
@@ -735,24 +838,24 @@ public:
 	/** Downsample scale (higher = better quality but slower). 1.0 = half res, 2.0 = full res */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
 		meta = (ClampMin = "0.25", ClampMax = "2.0", UIMin = "0.5", UIMax = "2.0",
-		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)", EditConditionHides))
+		        EditCondition = "bEnableBloom"))
 	float DownsampleScale = 1.0f;
 
 	/** Number of blur passes (more passes = smoother bloom but slower) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
 		meta = (ClampMin = "1", ClampMax = "4", UIMin = "1", UIMax = "4",
-		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)", EditConditionHides))
+		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)"))
 	int32 BlurPasses = 1;
 
 	/** Blur quality - number of samples per tap (5, 9, or 13) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
 		meta = (ClampMin = "5", ClampMax = "13", UIMin = "5", UIMax = "13",
-		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)", EditConditionHides))
+		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)"))
 	int32 BlurSamples = 5;
 
 	/** Use high quality upsampling (slower but reduces pixelation) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
-		meta = (EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)", EditConditionHides))
+		meta = (EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)"))
 	bool bHighQualityUpsampling = false;
 
 	// ---- Directional Glare ----
@@ -780,6 +883,13 @@ public:
 		meta = (ClampMin = "0.5", ClampMax = "10.0", UIMin = "1.0", UIMax = "5.0",
 		        EditCondition = "bEnableBloom && BloomMode == EBloomMode::DirectionalGlare", EditConditionHides))
 	float GlareFalloff = 3.0f;
+
+	/** Number of samples per streak direction (higher = smoother streaks, slower).
+	 *  8=fast, 16=default, 32=high, 48/64=ultra quality. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Directional Glare",
+		meta = (ClampMin = "8", ClampMax = "64", UIMin = "8", UIMax = "64",
+		        EditCondition = "bEnableBloom && BloomMode == EBloomMode::DirectionalGlare", EditConditionHides))
+	int32 GlareSamples = 16;
 
 	// ---- Kawase Bloom ----
 
@@ -814,21 +924,121 @@ public:
 	UPROPERTY() float SoftFocusFinalBlend = 0.25f;
 
 	// =========================================================================
-	// Debug
+	// Vignette
 	// =========================================================================
 
-	/** Blend between original (0) and processed (1). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Debug",
-		meta=(ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
-	float BlendAmount = 1.0f;
+	/** Enable vignette effect (screen-space darkening / lightening from edges). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette")
+	bool bEnableVignette = false;
 
-	/** Show original on left half, processed on right half. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Debug")
-	bool bSplitScreenComparison = false;
+	/** Vignette shape: Circular (radial) or Square (per-edge). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(EditCondition = "bEnableVignette"))
+	EVignetteMode VignetteMode = EVignetteMode::Circular;
 
-	/** Print debug info to log. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Debug")
-	bool bEnableDebugLogging = false;
+	/** Size of the clear zone from center.  0 = all vignette, 100 = no vignette. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(ClampMin = "0.0", ClampMax = "100.0", UIMin = "0.0", UIMax = "100.0",
+		      EditCondition = "bEnableVignette"))
+	float VignetteSize = 30.0f;
+
+	/** Vignette intensity.  Positive = darken edges.  Negative = lighten edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0",
+		      EditCondition = "bEnableVignette"))
+	float VignetteIntensity = 50.0f;
+
+	/** Falloff curve shape.  Controls how the gradient transitions from clear center to darkened edge. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(EditCondition = "bEnableVignette"))
+	EVignetteFalloff VignetteFalloff = EVignetteFalloff::Smooth;
+
+	/** Power exponent for the Custom falloff curve.  <1 = hard edge, 1 = linear, >1 = soft/gradual. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(ClampMin = "0.1", ClampMax = "8.0", UIMin = "0.1", UIMax = "5.0",
+		      EditCondition = "bEnableVignette && VignetteFalloff == EVignetteFalloff::Custom"))
+	float VignetteFalloffExponent = 2.0f;
+
+	/** Use an alpha texture mask for custom vignette shapes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(EditCondition = "bEnableVignette"))
+	bool bVignetteUseAlphaTexture = false;
+
+	/** Texture mask.  The selected channel controls per-pixel vignette strength.
+	    White (1) = no vignette, Black (0) = full vignette. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(EditCondition = "bEnableVignette && bVignetteUseAlphaTexture"))
+	TObjectPtr<UTexture> VignetteAlphaTexture;
+
+	/** Which channel of the texture to read as the mask value.
+	    Use Red for single-channel / grayscale textures, Alpha for packed RGBA. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(EditCondition = "bEnableVignette && bVignetteUseAlphaTexture"))
+	EVignetteTextureChannel VignetteTextureChannel = EVignetteTextureChannel::Alpha;
+
+	/** When enabled, only the texture drives the effect — no procedural vignette
+	    geometry.  The scene is multiplied by the texture mask, with Intensity as strength. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Vignette",
+		meta=(EditCondition = "bEnableVignette && bVignetteUseAlphaTexture"))
+	bool bVignetteAlphaTextureOnly = false;
+
+	// =========================================================================
+	// LUT (Color Grading Look-Up Table)
+	// =========================================================================
+
+	/** Enable LUT-based color grading.  Applies a standard UE LUT texture as a
+	    final color-grade lookup after all ToneMapFX processing (post-tonemap,
+	    post-sRGB).  Supported resolutions: 256x16, 1024x32, 4096x64. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|LUT")
+	bool bEnableLUT = false;
+
+	/** Color Grading LUT texture.
+	    Standard UE format: horizontal strip of N slices, each N×N pixels.
+	    Common sizes: 256×16 (16³), 1024×32 (32³), 4096×64 (64³). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|LUT",
+		meta=(EditCondition = "bEnableLUT"))
+	TObjectPtr<UTexture> LUTTexture;
+
+	/** LUT blend intensity.  0 = no effect (bypass), 1 = full LUT. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|LUT",
+		meta=(ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0",
+		      EditCondition = "bEnableLUT"))
+	float LUTIntensity = 1.0f;
+
+	// =========================================================================
+	// Engine Overrides
+	// =========================================================================
+
+	/** Disable Unreal Engine's built-in bloom (zeros BloomIntensity).
+	 *  Recommended when using ToneMapFX bloom to avoid double-bloom. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Engine Overrides")
+	bool bDisableUnrealBloom = true;
+
+	// =========================================================================
+	// Presets (Save / Load to .txt files via OS file dialog)
+	// =========================================================================
+
+#if WITH_EDITOR
+	/** Open a Save File dialog to choose where to save the preset. */
+	UFUNCTION(CallInEditor, Category = "Tone Map|Presets")
+	void SavePresetAs();
+
+	/** Open a file browser to load a preset from any location. */
+	UFUNCTION(CallInEditor, Category = "Tone Map|Presets")
+	void LoadPresetBrowse();
+#endif
+
+	/** Save all settings to an absolute file path. */
+	UFUNCTION(BlueprintCallable, Category = "Tone Map|Presets")
+	bool SavePresetToPath(const FString& FilePath) const;
+
+	/** Load settings from an absolute file path. */
+	UFUNCTION(BlueprintCallable, Category = "Tone Map|Presets")
+	bool LoadPresetFromPath(const FString& FilePath);
+
+	/** Returns the default directory where preset files are stored. */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Tone Map|Presets")
+	static FString GetPresetDirectory();
 
 	// =========================================================================
 	// Helpers

@@ -4,8 +4,8 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/ScreenPass.ush"
 
-// Simple brightness extraction shader
-// Extracts pixels above threshold for bloom
+// Brightness extraction shader with soft-knee threshold and HDR compression
+// Extracts pixels above threshold for bloom processing
 
 // Parameters are bound from C++ SHADER_PARAMETER_STRUCT
 Texture2D SceneColorTexture;
@@ -15,6 +15,23 @@ float4 OutputViewportSizeAndInvSize;
 FScreenTransform SvPositionToInputTextureUV; // Transform from SvPosition to scene color texture UV
 float BloomThreshold;
 float BloomIntensity;
+float ThresholdSoftness;  // 0..1  — 0 = hard cutoff, 1 = very wide/soft transition
+float MaxBrightness;      // Clamp extreme HDR values to prevent banding artifacts (0 = no clamp)
+
+// Soft-knee threshold — identical maths to the Kawase path so the two modes
+// produce a consistent look.  Creates a smooth quadratic ramp instead of
+// a hard step, completely eliminating the "cutoff circle" artifact that the
+// old fixed-width smoothstep produced on very bright point sources.
+float3 SoftKneeThreshold(float3 color, float threshold, float knee)
+{
+	float brightness = max(max(color.r, color.g), color.b);
+	float soft = brightness - threshold + knee;
+	soft = clamp(soft, 0.0, 2.0 * knee);
+	soft = soft * soft / (4.0 * knee + 0.00001);
+	float contribution = max(soft, brightness - threshold);
+	contribution /= max(brightness, 0.00001);
+	return color * max(contribution, 0.0);
+}
 
 void BrightPassPS(
 	float4 SvPosition : SV_POSITION,
@@ -27,24 +44,39 @@ void BrightPassPS(
 	// Sample from full-resolution scene color
 	float4 SceneColor = Texture2DSample(SceneColorTexture, SceneColorSampler, SceneColorUV);
 	
-	// Calculate luminance (perceived brightness)
-	float Luminance = dot(SceneColor.rgb, float3(0.299, 0.587, 0.114));
+	// Very low threshold (< 0.02) means we're in soft focus mode — capture full scene
+	float3 Bloom;
 	
-	// Apply threshold with smooth falloff for natural bloom like old games
-	// Very low threshold (< 0.02) means we're in soft focus mode - capture full scene
-	float BrightMask = 1.0;
-	
-	if (BloomThreshold >= 0.02)
+	if (BloomThreshold < 0.02)
 	{
-		// Normal bloom mode: extract only highlights above threshold
-		// Use smooth step for gradual transition (more natural than hard cutoff)
-		float ThresholdMin = BloomThreshold;
-		float ThresholdMax = BloomThreshold + 0.5; // Smooth transition zone
-		BrightMask = smoothstep(ThresholdMin, ThresholdMax, Luminance);
+		// Soft Focus mode: let everything through
+		Bloom = SceneColor.rgb;
+	}
+	else if (ThresholdSoftness > 0.001)
+	{
+		// Soft-knee threshold: smooth quadratic ramp that scales with the
+		// threshold value, producing a natural falloff at any brightness level
+		float Knee = BloomThreshold * ThresholdSoftness;
+		Bloom = SoftKneeThreshold(SceneColor.rgb, BloomThreshold, Knee);
+	}
+	else
+	{
+		// Hard threshold (legacy behaviour)
+		float Brightness = max(max(SceneColor.r, SceneColor.g), SceneColor.b);
+		Bloom = SceneColor.rgb * step(BloomThreshold, Brightness);
 	}
 	
-	// Output extracted brightness
-	// Keep color information intact for better bloom quality
-	OutColor.rgb = SceneColor.rgb * BrightMask;
-	OutColor.a = 1.0;
+	// Clamp extreme HDR values — prevents a single super-bright texel from
+	// dominating the blur and creating visible banding rings.
+	// This is the non-Kawase equivalent of the Karis average.
+	if (MaxBrightness > 0.0)
+	{
+		float Lum = dot(Bloom, float3(0.299, 0.587, 0.114));
+		if (Lum > MaxBrightness)
+		{
+			Bloom *= MaxBrightness / Lum;
+		}
+	}
+	
+	OutColor = float4(Bloom, 1.0);
 }

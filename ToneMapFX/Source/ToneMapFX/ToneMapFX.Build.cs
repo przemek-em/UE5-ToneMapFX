@@ -25,7 +25,8 @@ public class ToneMapFX : ModuleRules
 			new string[]
 			{
 				"Slate",
-				"SlateCore"
+				"SlateCore",
+				"DesktopPlatform"
 			}
 		);
 
