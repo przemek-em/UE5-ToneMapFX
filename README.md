@@ -1,10 +1,10 @@
-﻿[![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.6.1+-blue.svg)](https://www.unrealengine.com/)
+[![Unreal Engine](https://img.shields.io/badge/Unreal%20Engine-5.6.1+-blue.svg)](https://www.unrealengine.com/)
 [![License](https://img.shields.io/badge/License-Zlib-lightgrey.svg)](LICENSE)
 [![Experimental](https://img.shields.io/badge/Status-Experimental-orange.svg)]()
 
 # Tone Map FX
 
-A post-process plugin for Unreal Engine 5.6 that brings **Photo RAW style color grading** directly into the engine viewport. Run it on top of UE's built-in tonemapper, or **fully replace** ACES with classic film curves (Hable, Reinhard, Durand, Fattal).
+A post-process plugin for Unreal Engine 5.6 that brings **Photo RAW style color grading** directly into the engine viewport. Run it on top of UE's built-in tonemapper, or **fully replace** ACES with classic film curves (Hable, Reinhard, Durand, Fattal, AgX).
 ![Image](Screens/HighresScreenshot00041.jpg)
 
 ---
@@ -12,9 +12,12 @@ A post-process plugin for Unreal Engine 5.6 that brings **Photo RAW style color 
 ## Getting Started
 
 1. **Enable the plugin** - *Edit -> Plugins -> Rendering -> Tone Map FX*
-2. **Add the component** - Add or select any Actor -> Add Component -> *"Tone Map FX"*
+2. **Add the actor or component**
+   - **Place Actors panel** - Search *"Tone Map FX"* and drag `AToneMapActor` into the scene
+   - **Or** select any Actor -> Add Component -> *"Tone Map FX"*
 3. **Tweak sliders** - All changes are visible in real time in the viewport
-4. **Blueprint / C++ ready** - All properties are exposed for runtime control
+4. **Save / Load presets** - Use the *Presets* buttons in the Details panel to save and share `.txt` preset files
+5. **Blueprint / C++ ready** - All properties are exposed for runtime control
 
 ---
 
@@ -67,12 +70,15 @@ Smooth feathering between adjacent ranges prevents hard color boundaries.
 - **Reinhard (Standard)** - Classic per-channel with extended white point
 - **Durand-Dorsey 2002 (Bilateral)** - Bilateral-filter tone mapping. Decomposes the scene log-luminance into a *base layer* (large-scale illumination) and a *detail layer* (fine structures). Compresses only the base layer, then recombines - preserving micro-contrast while reducing overall dynamic range. Configurable spatial sigma, range sigma, base compression factor, and detail boost.
 - **Fattal et al. 2002 (Gradient Domain)** (experimental) - Gradient-domain tone mapping. Attenuates large luminance gradients while leaving small ones intact. Implemented as a 4-pass RDG pipeline: attenuated gradient field -> divergence field -> iterative Jacobi Poisson solver -> tone-mapped reconstruction. Seeded from log-luminance for correct partial-convergence behavior. Configurable alpha/beta attenuation, noise floor, output saturation, and solver iteration count.
+- **AgX (Sobotka)** - Display rendering transform by Troy Sobotka. Inset matrix → log2 encoding → polynomial sigmoid tone curve → outset matrix. Preserves hue and saturation through highlight compression with minimal color clipping. Three creative looks: *None* (base), *Punchy* (vivid contrast), *Golden* (warm golden-hour). Configurable min/max EV encoding range.
 - **HDR Saturation & Color Balance** - Pre-curve adjustments in linear HDR
 
 ### Auto-Exposure *(Replace Tonemapper Mode)*
-- **Manual** - No automatic adjustment
-- **Engine Default** - UE's built-in eye adaptation
-- **Krawczyk** - Scene key estimation with temporal adaptation that mimics human eye behavior (fast bright-adapt, slow dark-adapt)
+- **Manual (None)** - No automatic exposure. UE's built-in exposure is disabled automatically; only the manual Exposure slider applies.
+- **Engine Default** - UE's built-in eye adaptation remains active and passes exposure through.
+- **Krawczyk** (experimental) - Scene key estimation with temporal adaptation that mimics human eye behavior (fast bright-adapt, slow dark-adapt). UE's built-in exposure is disabled automatically.
+
+> **Exposure Independence:** When set to *Krawczyk* or *None*, ToneMapFX automatically neutralizes UE's entire exposure pipeline (forces `AEM_Manual`, zeros `AutoExposureBias`, disables physical camera exposure, and neutralizes local exposure contrast) so that only ToneMapFX controls the scene brightness.
 
 ### Bloom
 Four bloom styles:
@@ -86,35 +92,50 @@ Four bloom styles:
 
 **Compositing:** 7 blend modes (Screen, Overlay, Soft Light, Hard Light, Lighten, Multiply, Additive) - color tinting - saturation - highlight protection - quality controls
 
-### Lens Effects *(available in both modes)*
+**Threshold:** Soft-knee quadratic threshold with configurable softness (eliminates hard cutoff circles around bright sources). MaxBrightness HDR clamp prevents banding/quantization rings from extreme values like the sun.
+
+**Directional Glare** now supports configurable sample count (8–64) for quality/performance trade-off.
+
+### Additional Lens Effects *(available in both modes)*
 
 | Effect | Description |
 |--------|-------------|
 | **Ciliary Corona** | Diffraction spike streaks radiating from very bright light sources. Configurable spike count (2-16), length, threshold, and intensity. Check also very similar kawase bloom setting. |
 | **Lenticular Halo** | Physically-based scattering ring around bright sources. Uses chromatic dispersion - red channel sampled at a slightly larger radius, blue at a slightly smaller radius - producing a violet-inside/red-outside iridescent ring matching real lens coating behavior. Configurable radius, thickness, threshold, intensity, and tint. Can be used in some specific cases. |
 
+### Vignette
+Screen-space darkening or lightening from edges with full creative control.
+
+- **Shape** - Circular (radial) or Square (per-edge Chebyshev distance)
+- **Falloff** - 5 curves: Linear, Smooth (smoothstep), Soft (smootherstep), Hard (sqrt), Custom (power exponent)
+- **Signed intensity** - Positive darkens edges, negative lightens edges
+- **Alpha texture mask** - Use any texture channel (R/G/B/A) as a custom vignette shape
+- **Texture-only mode** - Bypass procedural vignette entirely; scene is multiplied by texture mask
+- Blue-noise dithering eliminates banding in smooth gradients
+
+### LUT (Color Grading Look-Up Table)
+Apply standard UE LUT textures as a final color-grade lookup after all ToneMapFX processing.
+
+- Supported resolutions: **256×16** (16³), **1024×32** (32³), **4096×64** (64³)
+- 2D-unwrapped 3D texture sampling with bilinear interpolation between slices
+- Intensity slider to blend between original and graded color
+
+### Presets (Save / Load)
+Save and load all ToneMapFX settings to `.txt` files using OS native file dialogs.
+
+- **Save Preset As** / **Load Preset** - Buttons in the actor and component Details panel
+- `SavePresetToPath()` / `LoadPresetFromPath()` - Blueprint-callable API
+- Reflection-based serialization — automatically handles all property types including enums, colors, textures, and vectors
+- Presets are forward/backward compatible — unknown properties are skipped gracefully
+- Default directory: `Saved/ToneMapFX/`
+
+### Engine Overrides
+- **Disable Unreal Bloom** - Zeros UE's `BloomIntensity` to prevent double-bloom when using ToneMapFX bloom (enabled by default)
+- **Automatic Exposure Neutralization** - When exposure mode is *Krawczyk* or *None*, UE's entire exposure system is disabled (see Auto-Exposure section)
+
 ### Camera Settings
 Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure derived from real-world camera parameters.
 
-### Debug
-- **Blend Amount** - Crossfade original <-> processed
-- **Split Screen** - Side-by-side comparison (left = original, right = processed)
-- **Debug Logging** - Print shader parameters to log
-
----
-
-## Changelog
-
-### 18.02.2026
-
-#### New Features
-- **Durand-Dorsey 2002 bilateral tone mapping** - Full 3-pass RDG implementation (log-lum -> bilateral base layer -> reconstruct). Correct mid-grey anchoring formula ensures the base layer is properly compressed and smooth areas are anchored to mid-grey.
-- **Fattal et al. 2002 gradient-domain tone mapping** - Full 4-pass RDG implementation (gradient attenuation -> divergence -> Jacobi Poisson solve -> reconstruct). Seeded from log(lum) for correct partial-convergence. Reconstruction uses ratio = exp(I - logLumIn) clamped to [0.02, 8] - smooth areas get ratio ~1, contrast edges get ratio <1 (attenuation).
-- **Ciliary Corona lens effect** - New lens effect producing diffraction spike streaks from very bright light sources. Configurable spike count (2-16), length, threshold, and intensity.
-- **Lenticular Halo lens effect** - New physically-based scattering ring around bright sources with chromatic dispersion: each RGB channel is sampled at a distinct radius (R at radius + 0.6*thickness, B at radius - 0.6*thickness) producing a violet-inside/red-outside iridescent ring instead of a flat scene copy. 32 angular x 5 radial Gaussian samples eliminate polygon banding artifacts.
-
-#### Bug Fixes
-- **Gaussian blur echo / ghost artifact** - Both ToneMapBlur.usf (Clarity) and ClassicBloomBlur.usf were using BlurRadius as the *step distance* between sparse taps rather than as Gaussian sigma, causing aliased skipped-texel sampling. Both shaders now use a dense per-texel Gaussian kernel (sigma = BlurRadius, samples every texel out to 3*sigma, properly normalized).
 
 ---
 
@@ -127,15 +148,15 @@ Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure 
 
 ## Roadmap
 
+- [x] ~~AgX tonemapper~~ *(done — AgX with Punchy/Golden looks)*
+- [x] ~~Vignette~~ *(done — Circular/Square, 5 falloffs, texture mask)*
+- [x] ~~LUT import~~ *(done — 16³/32³/64³ LUT color grading)*
+- [x] ~~Bloom bugfixes~~ *(done — soft-knee threshold, MaxBrightness clamp, PF_FloatRGBA)*
 - [ ] Bounding box - multiple postprocess actors, blending across them
-- [ ] Additional AgX tonemapper
 - [ ] Additional RGB curves
-- [ ] Vignette
 - [ ] Sharpen, additional mode for pixel radius
 - [ ] Texture overlay
 - [ ] Custom light shafts
-- [ ] LUT import
-- [ ] Bloom bugfixes
 
 ---
 
@@ -179,3 +200,9 @@ The Poisson equation `Laplacian(I) = div(H)` is solved iteratively with Jacobi r
 - **[Fattal et al. 2002 (ACM DL)](https://dl.acm.org/doi/10.1145/566654.566573)**
 
 Key parameters: `Alpha` - gradient magnitude reference threshold (lower = more uniform attenuation); `Beta` - attenuation exponent (lower = stronger compression); `FattalJacobiIterations` - solver iteration count (30 is a good default with logLum seeding); `FattalSaturation` - output chrominance scale.
+
+### AgX Display Rendering Transform
+Based on Troy Sobotka's open-source AgX display rendering pipeline. Scene-linear RGB is transformed through an inset matrix (working space rotation), log2-encoded across a configurable EV range, shaped by a polynomial sigmoid tone curve, then transformed back through an outset matrix. The sigmoid preserves hue and saturation through highlight compression with minimal color clipping — a key advantage over ACES. Creative looks (Punchy, Golden) are applied as post-curve ASC-CDL-style transforms.
+
+- **[Troy Sobotka — AgX (GitHub)](https://github.com/sobotka/AgX)**
+- **[AgX / Troy Sobotka — Blender Documentation](https://docs.blender.org/manual/en/latest/render/color_management/color_spaces.html)**
