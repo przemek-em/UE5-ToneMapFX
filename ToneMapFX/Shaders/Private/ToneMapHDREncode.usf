@@ -1,0 +1,137 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// ============================================================================
+// ToneMapFX — Final HDR Output Encoding Pass
+//
+// Runs as the LAST pass in the ToneMapFX pipeline (after ToneMapProcess, LUT,
+// and Vignette).  Converts the sRGB-gamma output to the display's native HDR
+// encoding (ST2084/PQ for HDR10, scRGB linear for Windows HDR).
+//
+// Input:  sRGB display-referred color (same as SDR final output)
+// Output: Display-encoded HDR signal
+// ============================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// Scene color input (sRGB-encoded output of previous pass)
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+
+// HDR parameters (set from C++ via GetTonemapperOutputDeviceParameters)
+float OutputDeviceType;  // EDisplayOutputFormat cast to float
+float PaperWhiteNits;    // User-configurable paper-white brightness (default 200)
+float MaxDisplayNits;    // Peak display luminance from OS/driver
+
+// ============================================================================
+// Output device IDs (mirrors EDisplayOutputFormat)
+// ============================================================================
+#define TMFX_OUTPUT_sRGB              0
+#define TMFX_OUTPUT_Rec709            1
+#define TMFX_OUTPUT_ExplicitGamma     2
+#define TMFX_OUTPUT_ST2084_1000nit    3
+#define TMFX_OUTPUT_ST2084_2000nit    4
+#define TMFX_OUTPUT_ScRGB_1000nit     5
+#define TMFX_OUTPUT_ScRGB_2000nit     6
+
+// ============================================================================
+// sRGB EOTF — decode sRGB gamma to linear light
+// ============================================================================
+float3 SRGBToLinearFull(float3 sRGB)
+{
+	// Exact IEC 61966-2-1 inverse EOTF
+	float3 lo = sRGB / 12.92;
+	float3 hi = pow(max((sRGB + 0.055) / 1.055, 0.0), 2.4);
+	return select(sRGB <= 0.04045, lo, hi);
+}
+
+// ============================================================================
+// ST2084 (PQ / Dolby Perceptual Quantizer) — ITU-R BT.2100
+// ============================================================================
+static const float PQ_m1 = 0.1593017578125;     // 2610 / 16384
+static const float PQ_m2 = 78.84375;             // 2523 / 32 * 128
+static const float PQ_c1 = 0.8359375;            // 3424 / 4096
+static const float PQ_c2 = 18.8515625;           // 2413 / 128
+static const float PQ_c3 = 18.6875;              // 2392 / 128
+
+float3 LinearToST2084(float3 Nits)
+{
+	float3 Y   = Nits / 10000.0;
+	float3 Ym1 = pow(max(Y, 0.0), PQ_m1);
+	return pow((PQ_c1 + PQ_c2 * Ym1) / (1.0 + PQ_c3 * Ym1), PQ_m2);
+}
+
+// ============================================================================
+// BT.709 → BT.2020 color space conversion (Rec.2020 wide gamut)
+// ============================================================================
+static const float3x3 BT709_to_BT2020 = float3x3(
+	0.627402, 0.329292, 0.043306,
+	0.069095, 0.919544, 0.011360,
+	0.016394, 0.088028, 0.895578
+);
+
+// ============================================================================
+// scRGB: 1.0 = 80 nits (sRGB reference white)
+// ============================================================================
+static const float SCRGB_WHITE_NITS = 80.0;
+
+// ============================================================================
+// Main HDR Encode Pixel Shader
+// ============================================================================
+void HDREncodePS(
+	float4 SvPosition : SV_Position,
+	out float4 OutColor : SV_Target0)
+{
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 srgb = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb;
+
+	// Step 1: Decode sRGB gamma → linear light [0,1]
+	float3 linearColor = SRGBToLinearFull(srgb);
+
+	// Clamp paper-white to sane range
+	float paperWhite = clamp(PaperWhiteNits, 80.0, 500.0);
+
+	if (OutputDeviceType > 2.5 && OutputDeviceType < 4.5)
+	{
+		// ──────────────────────────────────────────────────────────
+		// HDR10: ST2084 / PQ encoding
+		// ──────────────────────────────────────────────────────────
+		// Map linear [0,1] to nits: 0 → 0 nits, 1.0 → paperWhite nits.
+		// This makes the tone-mapped white point match the user's
+		// desired paper-white brightness.
+		float3 nits = linearColor * paperWhite;
+
+		// Convert BT.709 → BT.2020 wide gamut (required by ST2084 spec)
+		nits = mul(BT709_to_BT2020, nits);
+
+		// Protect against negatives before PQ pow
+		nits = max(nits, 0.0);
+
+		// Apply ST2084 Perceptual Quantizer encoding
+		OutColor = float4(LinearToST2084(nits), 1.0);
+	}
+	else if (OutputDeviceType > 4.5 && OutputDeviceType < 6.5)
+	{
+		// ──────────────────────────────────────────────────────────
+		// Windows HDR: scRGB linear encoding
+		// ──────────────────────────────────────────────────────────
+		// scRGB: value 1.0 = 80 nits (sRGB reference white).
+		// Map our linear [0,1] so that 1.0 (peak white) = paperWhite nits.
+		// paperWhite / 80 gives the scRGB multiplier.
+		float3 scrgb = linearColor * (paperWhite / SCRGB_WHITE_NITS);
+
+		// scRGB: no clamp, no gamma — output linear float16
+		OutColor = float4(scrgb, 1.0);
+	}
+	else
+	{
+		// ──────────────────────────────────────────────────────────
+		// SDR fallback — pass through unchanged
+		// ──────────────────────────────────────────────────────────
+		// This path should not normally be reached (the HDR encode pass
+		// is only added when the display is HDR), but provides a safe
+		// identity fallback: output the sRGB input unchanged.
+		OutColor = float4(srgb, 1.0);
+	}
+}

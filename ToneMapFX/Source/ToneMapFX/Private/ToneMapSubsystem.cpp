@@ -13,6 +13,8 @@
 #include "SceneRendering.h"
 #include "ScreenPass.h"
 #include "PostProcess/PostProcessMaterialInputs.h"
+#include "PostProcess/PostProcessTonemap.h"
+#include "ToneMapHDREncode.h"
 #include "RenderGraphUtils.h"
 #include "PixelShaderUtils.h"
 
@@ -44,6 +46,21 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 		if (Ptr.IsValid() && Ptr->IsActive() && Ptr->bEnabled)
 		{
 			bCachedReplaceTonemap = (Ptr->Mode == EToneMapMode::ReplaceTonemap);
+			bCachedHDROutput = Ptr->bHDROutput;
+
+			// Auto-toggle r.HDR.EnableHDROutput to match the UI checkbox.
+			// IConsoleManager is available through CoreMinimal.h — no extra includes.
+			{
+				static IConsoleVariable* CVarHDR = IConsoleManager::Get().FindConsoleVariable(TEXT("r.HDR.EnableHDROutput"));
+				if (CVarHDR)
+				{
+					const int32 DesiredValue = (bCachedReplaceTonemap && bCachedHDROutput) ? 1 : 0;
+					if (CVarHDR->GetInt() != DesiredValue)
+					{
+						CVarHDR->Set(DesiredValue, ECVF_SetByCode);
+					}
+				}
+			}
 
 			// Cache delta time for render thread (temporal adaptation)
 			LastDeltaTime = FApp::GetDeltaTime();
@@ -1374,10 +1391,25 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	const bool bNeedVignette = ActiveComp->bEnableVignette
 		&& FMath::Abs(ActiveComp->VignetteIntensity) > 0.01f;
 
+	// HDR output encoding as a final pass: requires ReplaceTonemap + HDR checkbox +
+	// an HDR-capable display (OutputDevice >= 3 in EDisplayOutputFormat).
+	const bool bWantHDREncode = bIsReplaceTonemap && ActiveComp->bHDROutput && bCachedHDROutput;
+	bool bNeedHDREncode = false;
+	uint32 HDROutputDevice = 0;
+	float  HDRMaxDisplayNits = 80.0f;
+	if (bWantHDREncode)
+	{
+		FTonemapperOutputDeviceParameters OutDevParams = GetTonemapperOutputDeviceParameters(*ViewInfo.Family);
+		HDROutputDevice = OutDevParams.OutputDevice;
+		HDRMaxDisplayNits = FMath::Max(OutDevParams.OutputMaxLuminance, 80.0f);
+		// Only add the HDR encode pass when the display is actually HDR (device >= 3)
+		bNeedHDREncode = (HDROutputDevice >= 3);
+	}
+
 	FScreenPassRenderTarget FinalOutputTarget = OutputTarget;
 
 	// If any post-passes follow ToneMapProcess, redirect it to an intermediate
-	if (bNeedLUT || bNeedVignette)
+	if (bNeedLUT || bNeedVignette || bNeedHDREncode)
 	{
 		OutputTarget = FScreenPassRenderTarget(
 			GraphBuilder.CreateTexture(
@@ -1615,7 +1647,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		// Determine LUT output target: another intermediate if vignette follows,
 		// otherwise write directly to FinalOutputTarget
 		FScreenPassRenderTarget LUTOutputTarget;
-		if (bNeedVignette)
+		if (bNeedVignette || bNeedHDREncode)
 		{
 			LUTOutputTarget = FScreenPassRenderTarget(
 				GraphBuilder.CreateTexture(
@@ -1683,20 +1715,40 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	// =====================================================================
 	if (bNeedVignette)
 	{
+		// Determine Vignette output: another intermediate if HDR encode follows,
+		// otherwise write directly to FinalOutputTarget.
+		FScreenPassRenderTarget VignetteOutputTarget;
+		if (bNeedHDREncode)
+		{
+			VignetteOutputTarget = FScreenPassRenderTarget(
+				GraphBuilder.CreateTexture(
+					FRDGTextureDesc::Create2D(
+						ViewportSize, SceneColor.Texture->Desc.Format,
+						FClearValueBinding::None,
+						TexCreate_ShaderResource | TexCreate_RenderTargetable),
+					TEXT("ToneMap.PreHDREncode")),
+				FIntRect(0, 0, ViewportSize.X, ViewportSize.Y),
+				ERenderTargetLoadAction::ENoAction);
+		}
+		else
+		{
+			VignetteOutputTarget = FinalOutputTarget;
+		}
+
 		auto* VP = GraphBuilder.AllocParameters<FToneMapVignettePS::FParameters>();
 		VP->View              = ViewInfo.ViewUniformBuffer;
 		VP->SceneColorTexture = OutputTarget.Texture;  // LUT output (or ToneMapProcess if no LUT)
 		VP->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
-		// UV transform: SvPosition in FinalOutputTarget → UV in previous pass intermediate
-		const FIntPoint FinalOutExtent(FinalOutputTarget.Texture->Desc.Extent.X,
-		                               FinalOutputTarget.Texture->Desc.Extent.Y);
-		const FScreenPassTextureViewport FinalOutVP(FinalOutExtent, FinalOutputTarget.ViewRect);
+		// UV transform: SvPosition in VignetteOutputTarget → UV in previous pass intermediate
+		const FIntPoint VigOutExtent(VignetteOutputTarget.Texture->Desc.Extent.X,
+		                               VignetteOutputTarget.Texture->Desc.Extent.Y);
+		const FScreenPassTextureViewport VigOutVP(VigOutExtent, VignetteOutputTarget.ViewRect);
 		const FScreenPassTextureViewport PreVignetteVP(
 			ViewportSize, FIntRect(0, 0, ViewportSize.X, ViewportSize.Y));
 
 		VP->SvPositionToSceneColorUV = (
-			FScreenTransform::ChangeTextureBasisFromTo(FinalOutVP,
+			FScreenTransform::ChangeTextureBasisFromTo(VigOutVP,
 				FScreenTransform::ETextureBasis::TexelPosition,
 				FScreenTransform::ETextureBasis::ViewportUV) *
 			FScreenTransform::ChangeTextureBasisFromTo(PreVignetteVP,
@@ -1734,13 +1786,61 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		}
 		VP->AlphaSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 
-		VP->RenderTargets[0] = FRenderTargetBinding(FinalOutputTarget.Texture, FinalOutputTarget.LoadAction);
+		VP->RenderTargets[0] = FRenderTargetBinding(VignetteOutputTarget.Texture, VignetteOutputTarget.LoadAction);
 
 		TShaderMapRef<FToneMapVignettePS> VignetteShader(ViewInfo.ShaderMap);
 		FPixelShaderUtils::AddFullscreenPass(
 			GraphBuilder, ViewInfo.ShaderMap,
 			RDG_EVENT_NAME("ToneMapVignette"),
 			VignetteShader, VP,
+			VignetteOutputTarget.ViewRect);
+
+		// Update OutputTarget so the HDR encode pass (if any) reads from Vignette output
+		OutputTarget = VignetteOutputTarget;
+	}
+
+	// =====================================================================
+	// HDR Output Encoding — final pass (ST2084/PQ or scRGB)
+	//
+	// Converts sRGB-encoded output to the display's native HDR format.
+	// Only runs when the display is actually in HDR mode (OutputDevice >= 3).
+	// =====================================================================
+	if (bNeedHDREncode)
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "ToneMapFX_HDREncode");
+
+		auto* HP = GraphBuilder.AllocParameters<FToneMapHDREncodePS::FParameters>();
+		HP->View              = ViewInfo.ViewUniformBuffer;
+		HP->SceneColorTexture = OutputTarget.Texture;
+		HP->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+		// UV transform: SvPosition in FinalOutputTarget → UV in previous pass
+		const FIntPoint HDROutExtent(FinalOutputTarget.Texture->Desc.Extent.X,
+		                              FinalOutputTarget.Texture->Desc.Extent.Y);
+		const FScreenPassTextureViewport HDROutVP(HDROutExtent, FinalOutputTarget.ViewRect);
+		const FScreenPassTextureViewport PreHDRVP(
+			FIntPoint(OutputTarget.Texture->Desc.Extent.X, OutputTarget.Texture->Desc.Extent.Y),
+			FIntRect(0, 0, OutputTarget.Texture->Desc.Extent.X, OutputTarget.Texture->Desc.Extent.Y));
+
+		HP->SvPositionToSceneColorUV = (
+			FScreenTransform::ChangeTextureBasisFromTo(HDROutVP,
+				FScreenTransform::ETextureBasis::TexelPosition,
+				FScreenTransform::ETextureBasis::ViewportUV) *
+			FScreenTransform::ChangeTextureBasisFromTo(PreHDRVP,
+				FScreenTransform::ETextureBasis::ViewportUV,
+				FScreenTransform::ETextureBasis::TextureUV));
+
+		HP->OutputDeviceType = (float)HDROutputDevice;
+		HP->PaperWhiteNits   = ActiveComp->PaperWhiteNits;
+		HP->MaxDisplayNits   = HDRMaxDisplayNits;
+
+		HP->RenderTargets[0] = FRenderTargetBinding(FinalOutputTarget.Texture, FinalOutputTarget.LoadAction);
+
+		TShaderMapRef<FToneMapHDREncodePS> HDRShader(ViewInfo.ShaderMap);
+		FPixelShaderUtils::AddFullscreenPass(
+			GraphBuilder, ViewInfo.ShaderMap,
+			RDG_EVENT_NAME("HDREncode"),
+			HDRShader, HP,
 			FinalOutputTarget.ViewRect);
 	}
 

@@ -39,6 +39,7 @@ private:
 
 	// Cached mode from game thread (read in SetupView)
 	bool bCachedReplaceTonemap = false;
+	bool bCachedHDROutput = false;
 
 	// Persistent adapted luminance for Krawczyk auto-exposure (survives across frames)
 	TRefCountPtr<IPooledRenderTarget> AdaptedLuminanceRT;

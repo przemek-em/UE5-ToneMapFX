@@ -181,6 +181,23 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map")
 	bool bEnabled = true;
 
+	/** Enable HDR output when running in ReplaceTonemap mode on an HDR monitor.
+	    When checked, the plugin outputs ST2084 (PQ) or scRGB instead of sRGB,
+	    matching the display's expected HDR encoding. Has no effect in PostProcess
+	    mode (UE's tonemapper already handles HDR encoding). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map",
+		meta=(EditCondition = "Mode == EToneMapMode::ReplaceTonemap"))
+	bool bHDROutput = false;
+
+	/** Paper-white brightness in nits (cd/m²).  Controls how bright the tone-mapped
+	    white point appears on the HDR display.  80 = sRGB reference white (dim),
+	    200 = typical PC monitor paper-white, 400 = bright.  Only used when HDR
+	    Output is enabled. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map",
+		meta=(EditCondition = "bHDROutput && Mode == EToneMapMode::ReplaceTonemap",
+		      ClampMin = "80.0", ClampMax = "500.0", UIMin = "80.0", UIMax = "500.0"))
+	float PaperWhiteNits = 200.0f;
+
 	// =========================================================================
 	// White Balance
 	// =========================================================================

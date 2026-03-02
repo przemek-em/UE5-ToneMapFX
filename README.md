@@ -27,7 +27,7 @@ A post-process plugin for Unreal Engine 5.6 that brings **Photo RAW style color 
 Runs **after** UE's built-in tonemapper on the already-processed LDR image. Safe, compatible, zero setup. Choose where to inject: after Tonemap, Motion Blur, FXAA, or at the very end.
 
 ### Replace Tonemapper Mode
-**Replaces UE's entire ACES pipeline.** Takes raw HDR scene color and maps it through a film curve. Eliminates ACES desaturation, glow artifacts, and red-shift. Full control over the HDR-to-LDR conversion with custom bloom and auto-exposure.
+**Replaces UE's entire ACES pipeline.** Takes raw HDR scene color and maps it through a film curve. Eliminates ACES desaturation, glow artifacts, and red-shift. Full control over the HDR-to-LDR conversion with custom bloom and auto-exposure. Supports **HDR monitor output** — see HDR Output section below.
 
 ---
 
@@ -113,6 +113,18 @@ Screen-space darkening or lightening from edges with full creative control.
 - **Texture-only mode** - Bypass procedural vignette entirely; scene is multiplied by texture mask
 - Blue-noise dithering eliminates banding in smooth gradients
 
+### HDR Output *(Replace Tonemapper Mode)*
+Optional HDR monitor support for the Replace Tonemapper pipeline.
+
+All film curves in ToneMapFX (Hable, Reinhard, Durand, Fattal, AgX) are **SDR tone curves by design** — they compress high-dynamic-range scene color into the standard sRGB [0, 1] range for SDR displays. However, when Replace Tonemapper mode is active, UE's built-in tonemapper (and its HDR output encoding) is completely bypassed. An HDR monitor would receive sRGB-encoded values with no way to interpret them as HDR — resulting in washed-out or dimly clipped output.
+
+The **HDR Output** feature adds a dedicated final encoding pass that takes the plugin's sRGB output and re-encodes it into the display's native HDR format. The tone curves themselves remain unchanged — they still produce SDR tone-mapped results — but those results are correctly presented on an HDR display at the user's chosen brightness level.
+
+- **HDR Output** checkbox — enables ST2084 (PQ) or scRGB encoding as a final pass after all processing (tone curve → LUT → Vignette → HDR encode). Automatically toggles `r.HDR.EnableHDROutput` to match.
+- **Paper White Nits** (80–500 cd/m²) — controls how bright the tone-mapped white point appears on the HDR display. 80 = sRGB reference white (dim), 200 = typical PC monitor, 400 = bright.
+- Supports both **HDR10** (ST2084/PQ with BT.2020 color space) and **Windows HDR** (scRGB).
+- Has no effect in Post-Process mode (UE's tonemapper already handles HDR encoding).
+
 ### LUT (Color Grading Look-Up Table)
 Apply standard UE LUT textures as a final color-grade lookup after all ToneMapFX processing.
 
@@ -127,7 +139,6 @@ Save and load all ToneMapFX settings to `.txt` files using OS native file dialog
 - `SavePresetToPath()` / `LoadPresetFromPath()` - Blueprint-callable API
 - Reflection-based serialization — automatically handles all property types including enums, colors, textures, and vectors
 - Presets are forward/backward compatible — unknown properties are skipped gracefully
-- Default directory: `Saved/ToneMapFX/`
 
 ### Engine Overrides
 - **Disable Unreal Bloom** - Zeros UE's `BloomIntensity` to prevent double-bloom when using ToneMapFX bloom (enabled by default)
@@ -152,6 +163,7 @@ Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure 
 - [x] ~~Vignette~~ *(done — Circular/Square, 5 falloffs, texture mask)*
 - [x] ~~LUT import~~ *(done — 16³/32³/64³ LUT color grading)*
 - [x] ~~Bloom bugfixes~~ *(done — soft-knee threshold, MaxBrightness clamp, PF_FloatRGBA)*
+- [x] ~~HDR monitor output~~ *(done — ST2084/PQ + scRGB encoding, Paper White Nits, auto CVar toggle)*
 - [ ] Camera Exposure settings - fix values
 - [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves
@@ -201,6 +213,16 @@ The Poisson equation `Laplacian(I) = div(H)` is solved iteratively with Jacobi r
 - **[Fattal et al. 2002 (ACM DL)](https://dl.acm.org/doi/10.1145/566654.566573)**
 
 Key parameters: `Alpha` - gradient magnitude reference threshold (lower = more uniform attenuation); `Beta` - attenuation exponent (lower = stronger compression); `FattalJacobiIterations` - solver iteration count (30 is a good default with logLum seeding); `FattalSaturation` - output chrominance scale.
+
+### HDR Output Encoding Standards
+The HDR encode pass uses publicly defined color science standards — no proprietary code:
+- **SMPTE ST 2084 (PQ)** — Perceptual Quantizer electro-optical transfer function for HDR10 displays. Maps linear luminance (0–10 000 cd/m²) to a perceptually uniform code-value range.
+- **ITU-R BT.2020** — Wide color gamut used by HDR10. The plugin applies the standard BT.709→BT.2020 color matrix.
+- **scRGB** — Microsoft's extended linear sRGB format for Windows HDR compositing. Values above 1.0 represent HDR luminance.
+
+- **[SMPTE ST 2084:2014](https://pub.smpte.org/doc/st2084/20140816-pub/)** — PQ EOTF specification
+- **[ITU-R BT.2020-2](https://www.itu.int/rec/R-REC-BT.2020)** — Ultra-high definition color space
+- **[scRGB (Microsoft)](https://en.wikipedia.org/wiki/ScRGB)** — Extended linear sRGB - check wiki references
 
 ### AgX Display Rendering Transform
 Based on Troy Sobotka's open-source AgX display rendering pipeline. Scene-linear RGB is transformed through an inset matrix (working space rotation), log2-encoded across a configurable EV range, shaped by a polynomial sigmoid tone curve, then transformed back through an outset matrix. The sigmoid preserves hue and saturation through highlight compression with minimal color clipping — a key advantage over ACES. Creative looks (Punchy, Golden) are applied as post-curve ASC-CDL-style transforms.
