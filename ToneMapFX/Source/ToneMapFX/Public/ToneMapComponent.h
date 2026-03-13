@@ -202,23 +202,33 @@ public:
 	// White Balance
 	// =========================================================================
 
+	/** Enable white balance adjustments. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|White Balance")
+	bool bEnableWhiteBalance = true;
+
 	/** Color temperature shift. Negative = cooler (blue), Positive = warmer (amber). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|White Balance",
-		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
+		meta=(ClampMin = "-1000.0", ClampMax = "1000.0", UIMin = "-1000.0", UIMax = "1000.0",
+		      EditCondition = "bEnableWhiteBalance"))
 	float Temperature = 0.0f;
 
 	/** Tint shift. Negative = green, Positive = magenta. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|White Balance",
-		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
+		meta=(ClampMin = "-1000.0", ClampMax = "1000.0", UIMin = "-1000.0", UIMax = "1000.0",
+		      EditCondition = "bEnableWhiteBalance"))
 	float Tint = 0.0f;
 
 	// =========================================================================
 	// Tone
 	// =========================================================================
 
+	/** Enable Highlights / Shadows / Whites / Blacks adjustments. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone")
+	bool bEnableToneAdjustments = true;
+
 	/** Exposure adjustment in photographic stops (EV). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone",
-		meta=(ClampMin = "-5.0", ClampMax = "5.0", UIMin = "-5.0", UIMax = "5.0"))
+		meta=(ClampMin = "-20.0", ClampMax = "20.0", UIMin = "-20.0", UIMax = "20.0"))
 	float Exposure = 0.0f;
 
 	/** Overall contrast. */
@@ -228,22 +238,26 @@ public:
 
 	/** Adjust highlight (bright) tonal range. Negative recovers, positive brightens. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone",
-		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
+		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0",
+		      EditCondition = "bEnableToneAdjustments"))
 	float Highlights = 0.0f;
 
 	/** Adjust shadow (dark) tonal range. Positive lifts, negative crushes. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone",
-		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
+		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0",
+		      EditCondition = "bEnableToneAdjustments"))
 	float Shadows = 0.0f;
 
 	/** Adjust white-point clipping. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone",
-		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
+		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0",
+		      EditCondition = "bEnableToneAdjustments"))
 	float Whites = 0.0f;
 
 	/** Adjust black-point clipping. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Tone",
-		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
+		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0",
+		      EditCondition = "bEnableToneAdjustments"))
 	float Blacks = 0.0f;
 
 	/** Controls how smoothly Highlights/Shadows/Whites/Blacks masks blend.
@@ -284,6 +298,23 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
 		meta=(ClampMin = "-100.0", ClampMax = "100.0", UIMin = "-100.0", UIMax = "100.0"))
 	float Saturation = 0.0f;
+
+	/** Enable sharpening (unsharp mask). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
+		meta=(DisplayName = "Enable Sharpening"))
+	bool bEnableSharpening = false;
+
+	/** Sharpening strength (unsharp mask amount). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
+		meta=(ClampMin = "0.0", ClampMax = "100.0", UIMin = "0.0", UIMax = "100.0",
+			  EditCondition = "bEnableSharpening"))
+	float SharpenAmount = 25.0f;
+
+	/** Pixel radius for sharpening detection. Smaller = finer detail, larger = coarser edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
+		meta=(ClampMin = "0.5", ClampMax = "5.0", UIMin = "0.5", UIMax = "5.0",
+			  EditCondition = "bEnableSharpening"))
+	float SharpenRadius = 1.0f;
 
 	// =========================================================================
 	// Dynamic Contrast (multi-scale local contrast & color correction)
@@ -459,19 +490,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Camera Settings")
 	bool bUseCameraExposure = false;
 
-	/** Camera sensor sensitivity (ISO). Higher = brighter + more noise (visual only). */
+	/** Camera sensor sensitivity (ISO). Standard stops: 100, 200, 400, 800, 1600, 3200, 6400. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Camera Settings",
 		meta=(ClampMin = "50.0", ClampMax = "25600.0", UIMin = "50.0", UIMax = "25600.0",
 			  EditCondition = "bUseCameraExposure"))
 	float CameraISO = 100.0f;
 
-	/** Shutter speed in seconds (e.g. 0.008 = 1/125s). */
+	/** Shutter speed denominator (e.g. 125 = 1/125s, 250 = 1/250s).
+	    Standard stops: 1 (1s), 2 (1/2s), 4, 8, 15, 30, 60, 125, 250, 500, 1000, 2000, 4000, 8000. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Camera Settings",
-		meta=(ClampMin = "0.00002", ClampMax = "30.0", UIMin = "0.0001", UIMax = "1.0",
+		meta=(DisplayName = "Shutter Speed (1/X)",
+			  ClampMin = "1.0", ClampMax = "8000.0", UIMin = "1.0", UIMax = "8000.0",
 			  EditCondition = "bUseCameraExposure"))
-	float ShutterSpeed = 0.008f;
+	float ShutterSpeedDenominator = 125.0f;
 
-	/** Aperture f-stop number. Lower = more light, shallower DOF. */
+	/** Aperture f-stop number. Lower = wider aperture, more light.
+	    Standard stops: f/1.4, 2, 2.8, 4, 5.6, 8, 11, 16, 22. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Camera Settings",
 		meta=(ClampMin = "1.0", ClampMax = "32.0", UIMin = "1.0", UIMax = "22.0",
 			  EditCondition = "bUseCameraExposure"))
@@ -491,6 +525,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced",
 		meta=(EditCondition = "Mode == EToneMapMode::PostProcess"))
 	EToneMapPostProcessPass PostProcessPass = EToneMapPostProcessPass::Tonemap;
+
+	/** Apply triangular-distribution dithering after processing to reduce 8-bit color banding.
+	    Active in both modes — prevents visible gradient steps on smooth areas (sky, fog). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced")
+	bool bEnableDithering = true;
 
 	// =========================================================================
 	// Auto-Exposure (ReplaceTonemap mode only)

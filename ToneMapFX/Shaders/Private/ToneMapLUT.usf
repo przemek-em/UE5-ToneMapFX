@@ -27,6 +27,14 @@ SamplerState LUTSampler;
 float LUTSize;        // cube dimension: 16, 32, or 64
 float InvLUTSize;     // 1.0 / LUTSize
 float LUTIntensity;   // 0 = bypass, 1 = full LUT
+float DitherQuantization; // 0 = off, 1/255 = 8-bit, 1/1023 = 10-bit
+
+// Interleaved gradient noise (Jimenez 2014)
+float IGNoise(float2 screenPos)
+{
+	float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+	return frac(magic.z * frac(dot(screenPos, magic.xy)));
+}
 
 // ============================================================================
 // 2D-unwrapped 3D texture sample
@@ -80,6 +88,14 @@ void LUTPS(
 
 	// Blend between original and LUT-graded based on intensity
 	float3 result = lerp(scene, lutColor, LUTIntensity);
+
+	// Dithering (last-pass only; quantum set by subsystem)
+	if (DitherQuantization > 0.0)
+	{
+		float n1 = IGNoise(SvPosition.xy);
+		float n2 = IGNoise(SvPosition.xy + float2(47.0, 17.0));
+		result += (n1 + n2 - 1.0) * DitherQuantization;
+	}
 
 	OutColor = float4(result, 1.0);
 }

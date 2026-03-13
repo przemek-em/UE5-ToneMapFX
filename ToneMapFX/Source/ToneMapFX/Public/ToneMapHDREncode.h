@@ -32,6 +32,7 @@ public:
 		SHADER_PARAMETER(float, OutputDeviceType)  // EDisplayOutputFormat cast to float
 		SHADER_PARAMETER(float, PaperWhiteNits)    // User paper-white brightness (cd/m²)
 		SHADER_PARAMETER(float, MaxDisplayNits)    // Peak display luminance (cd/m²)
+		SHADER_PARAMETER(float, DitherQuantization) // 0=off, 1/255=8-bit, 1/1023=10-bit
 
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()

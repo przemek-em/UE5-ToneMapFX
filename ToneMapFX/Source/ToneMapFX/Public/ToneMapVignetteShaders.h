@@ -36,6 +36,7 @@ public:
 		SHADER_PARAMETER(float, TextureChannelIndex) // 0=A, 1=R, 2=G, 3=B
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, AlphaTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, AlphaSampler)
+		SHADER_PARAMETER(float, DitherQuantization) // 0=off, 1/255=8-bit, 1/1023=10-bit
 
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()

@@ -8,6 +8,7 @@
 #include "ToneMapFattal.h"
 #include "ToneMapLensEffects.h"
 #include "ToneMapVignetteShaders.h"
+#include "ToneMapSharpenShaders.h"
 #include "ToneMapLUTShaders.h"
 #include "SceneView.h"
 #include "SceneRendering.h"
@@ -62,8 +63,10 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 				}
 			}
 
-			// Cache delta time for render thread (temporal adaptation)
-			LastDeltaTime = FApp::GetDeltaTime();
+			// Cache delta time for render thread (temporal adaptation).
+			// Clamp to ~66ms (15 fps) so hitches from shader compilation
+			// or other stalls don't cause the adaptation to lurch.
+			LastDeltaTime = FMath::Min((float)FApp::GetDeltaTime(), 0.066f);
 
 			if (bCachedReplaceTonemap)
 			{
@@ -1388,6 +1391,9 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		&& ActiveComp->LUTTexture->GetResource()->TextureRHI != nullptr
 		&& ActiveComp->LUTIntensity > 0.001f;
 
+	const bool bNeedSharpening = ActiveComp->bEnableSharpening
+		&& ActiveComp->SharpenAmount > 0.01f;
+
 	const bool bNeedVignette = ActiveComp->bEnableVignette
 		&& FMath::Abs(ActiveComp->VignetteIntensity) > 0.01f;
 
@@ -1408,13 +1414,48 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 	FScreenPassRenderTarget FinalOutputTarget = OutputTarget;
 
+	// =====================================================================
+	// Dithering quantum — auto-detect from display output bit depth
+	// Applied only in the LAST pass of the chain to avoid dither noise
+	// being averaged out by subsequent passes (e.g. sharpening kernel).
+	//
+	// UE's built-in tonemapper defaults to 1/1023 (10-bit), but its
+	// combined 3D LUT naturally introduces sub-LSB interpolation noise
+	// that acts as extra dithering.  Our per-pixel math doesn't get that
+	// free smoothing, so we default to 1/255 (8-bit) which is safe for
+	// both 8-bit and 10-bit displays — on a 10-bit panel the added noise
+	// is only ~¼ LSB, invisible in practice.
+	//
+	// HDR scRGB / float16 output → 0 (no quantization dithering needed).
+	// =====================================================================
+	float DitherQuantizationValue = 0.0f;
+	if (ActiveComp->bEnableDithering)
+	{
+		// Disable for HDR linear / scRGB — float16 has sufficient precision
+		const bool bIsHDRLinear = bNeedHDREncode && HDROutputDevice >= 5;
+
+		if (!bIsHDRLinear)
+		{
+			// Default to 8-bit quantum — safe for both 8-bit and 10-bit displays.
+			// On 10-bit panels the added noise is ~¼ LSB, imperceptible.
+			DitherQuantizationValue = 1.0f / 255.0f;
+		}
+	}
+
+	// Determine which pass is last in the chain (only it receives dithering)
+	const bool bToneMapIsLast  = !bNeedSharpening && !bNeedLUT && !bNeedVignette && !bNeedHDREncode;
+	const bool bSharpenIsLast  = bNeedSharpening && !bNeedLUT && !bNeedVignette && !bNeedHDREncode;
+	const bool bLUTIsLast      = bNeedLUT && !bNeedVignette && !bNeedHDREncode;
+	const bool bVignetteIsLast = bNeedVignette && !bNeedHDREncode;
+	const bool bHDREncodeIsLast = bNeedHDREncode;
+
 	// If any post-passes follow ToneMapProcess, redirect it to an intermediate
-	if (bNeedLUT || bNeedVignette || bNeedHDREncode)
+	if (bNeedSharpening || bNeedLUT || bNeedVignette || bNeedHDREncode)
 	{
 		OutputTarget = FScreenPassRenderTarget(
 			GraphBuilder.CreateTexture(
 				FRDGTextureDesc::Create2D(
-					ViewportSize, SceneColor.Texture->Desc.Format,
+					ViewportSize, PF_FloatRGBA,
 					FClearValueBinding::None,
 					TexCreate_ShaderResource | TexCreate_RenderTargetable),
 				TEXT("ToneMap.PrePostPasses")),
@@ -1555,8 +1596,8 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		}
 
 		// --- White Balance ---
-		P->Temperature = ActiveComp->Temperature;
-		P->Tint        = ActiveComp->Tint;
+		P->Temperature = ActiveComp->bEnableWhiteBalance ? ActiveComp->Temperature : 0.0f;
+		P->Tint        = ActiveComp->bEnableWhiteBalance ? ActiveComp->Tint : 0.0f;
 
 		// --- Exposure ---
 		P->ExposureValue = ActiveComp->Exposure;
@@ -1565,21 +1606,22 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		if (ActiveComp->bUseCameraExposure)
 		{
 			float N = FMath::Max(ActiveComp->Aperture, 1.0f);
-			float t = FMath::Max(ActiveComp->ShutterSpeed, 0.00001f);
+			float t = 1.0f / FMath::Max(ActiveComp->ShutterSpeedDenominator, 1.0f); // 1/X seconds
 			float S = FMath::Max(ActiveComp->CameraISO, 1.0f);
-			CameraEV = FMath::Log2(N * N / t) + FMath::Log2(100.0f / S);
-			const float ReferenceEV = FMath::Log2(5.6f * 5.6f / 0.008f) + FMath::Log2(100.0f / 100.0f);
-			CameraEV -= ReferenceEV;
+			float EV100 = FMath::Log2(N * N / t) + FMath::Log2(100.0f / S);
+			const float ReferenceEV = FMath::Log2(5.6f * 5.6f / (1.0f / 125.0f)) + FMath::Log2(100.0f / 100.0f);
+			// Negate: higher ISO / wider aperture / slower shutter = more light = positive compensation
+			CameraEV = ReferenceEV - EV100;
 		}
 		P->CameraEV           = CameraEV;
 		P->bUseCameraExposure = ActiveComp->bUseCameraExposure ? 1.0f : 0.0f;
 
 		// --- Tone ---
 		P->Contrast        = ActiveComp->Contrast;
-		P->HighlightsValue = ActiveComp->Highlights;
-		P->ShadowsValue    = ActiveComp->Shadows;
-		P->WhitesValue     = ActiveComp->Whites;
-		P->BlacksValue     = ActiveComp->Blacks;
+		P->HighlightsValue = ActiveComp->bEnableToneAdjustments ? ActiveComp->Highlights : 0.0f;
+		P->ShadowsValue    = ActiveComp->bEnableToneAdjustments ? ActiveComp->Shadows : 0.0f;
+		P->WhitesValue     = ActiveComp->bEnableToneAdjustments ? ActiveComp->Whites : 0.0f;
+		P->BlacksValue     = ActiveComp->bEnableToneAdjustments ? ActiveComp->Blacks : 0.0f;
 		P->ToneSmoothingValue = ActiveComp->ToneSmoothing;
 		P->ContrastMidpoint   = ActiveComp->ContrastMidpoint;
 
@@ -1628,6 +1670,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		// --- Feature toggles ---
 		P->bEnableHSL    = ActiveComp->IsAnyHSLActive()   ? 1.0f : 0.0f;
 		P->bEnableCurves = ActiveComp->IsAnyCurveActive()  ? 1.0f : 0.0f;
+		P->DitherQuantization = bToneMapIsLast ? DitherQuantizationValue : 0.0f;
 
 		P->RenderTargets[0] = FRenderTargetBinding(OutputTarget.Texture, OutputTarget.LoadAction);
 
@@ -1637,6 +1680,69 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			RDG_EVENT_NAME("ToneMapProcess"),
 			ProcessShader, P,
 			OutputTarget.ViewRect);
+	}
+
+	// =====================================================================
+	// Sharpening pass — runs after ToneMapProcess, before LUT
+	// =====================================================================
+	if (bNeedSharpening)
+	{
+		// Determine output: another intermediate if LUT/Vignette/HDR follows,
+		// otherwise write directly to FinalOutputTarget
+		FScreenPassRenderTarget SharpenOutputTarget;
+		if (bNeedLUT || bNeedVignette || bNeedHDREncode)
+		{
+			SharpenOutputTarget = FScreenPassRenderTarget(
+				GraphBuilder.CreateTexture(
+					FRDGTextureDesc::Create2D(
+						ViewportSize, PF_FloatRGBA,
+						FClearValueBinding::None,
+						TexCreate_ShaderResource | TexCreate_RenderTargetable),
+					TEXT("ToneMap.PreLUT")),
+				FIntRect(0, 0, ViewportSize.X, ViewportSize.Y),
+				ERenderTargetLoadAction::ENoAction);
+		}
+		else
+		{
+			SharpenOutputTarget = FinalOutputTarget;
+		}
+
+		auto* SP = GraphBuilder.AllocParameters<FToneMapSharpenPS::FParameters>();
+		SP->View              = ViewInfo.ViewUniformBuffer;
+		SP->SceneColorTexture = OutputTarget.Texture;  // ToneMapProcess output
+		SP->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+		// UV transform: SvPosition in SharpenOutputTarget → UV in ToneMapProcess intermediate
+		const FIntPoint SharpenOutExtent(SharpenOutputTarget.Texture->Desc.Extent.X,
+		                                 SharpenOutputTarget.Texture->Desc.Extent.Y);
+		const FScreenPassTextureViewport SharpenOutVP(SharpenOutExtent, SharpenOutputTarget.ViewRect);
+		const FScreenPassTextureViewport PreSharpenVP(
+			ViewportSize, FIntRect(0, 0, ViewportSize.X, ViewportSize.Y));
+
+		SP->SvPositionToSceneColorUV = (
+			FScreenTransform::ChangeTextureBasisFromTo(SharpenOutVP,
+				FScreenTransform::ETextureBasis::TexelPosition,
+				FScreenTransform::ETextureBasis::ViewportUV) *
+			FScreenTransform::ChangeTextureBasisFromTo(PreSharpenVP,
+				FScreenTransform::ETextureBasis::ViewportUV,
+				FScreenTransform::ETextureBasis::TextureUV));
+
+		SP->SharpenAmount = ActiveComp->SharpenAmount;
+		SP->SharpenRadius = ActiveComp->SharpenRadius;
+		SP->TexelSize     = FVector2f(1.0f / ViewportSize.X, 1.0f / ViewportSize.Y);
+		SP->DitherQuantization = bSharpenIsLast ? DitherQuantizationValue : 0.0f;
+
+		SP->RenderTargets[0] = FRenderTargetBinding(SharpenOutputTarget.Texture, SharpenOutputTarget.LoadAction);
+
+		TShaderMapRef<FToneMapSharpenPS> SharpenShader(ViewInfo.ShaderMap);
+		FPixelShaderUtils::AddFullscreenPass(
+			GraphBuilder, ViewInfo.ShaderMap,
+			RDG_EVENT_NAME("ToneMapSharpen"),
+			SharpenShader, SP,
+			SharpenOutputTarget.ViewRect);
+
+		// Update OutputTarget so LUT/Vignette/HDR reads from sharpened output
+		OutputTarget = SharpenOutputTarget;
 	}
 
 	// =====================================================================
@@ -1652,7 +1758,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			LUTOutputTarget = FScreenPassRenderTarget(
 				GraphBuilder.CreateTexture(
 					FRDGTextureDesc::Create2D(
-						ViewportSize, SceneColor.Texture->Desc.Format,
+						ViewportSize, PF_FloatRGBA,
 						FClearValueBinding::None,
 						TexCreate_ShaderResource | TexCreate_RenderTargetable),
 					TEXT("ToneMap.PreVignette")),
@@ -1696,6 +1802,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		LP->LUTSize      = LUTSize;
 		LP->InvLUTSize    = 1.0f / FMath::Max(LUTSize, 1.0f);
 		LP->LUTIntensity  = ActiveComp->LUTIntensity;
+		LP->DitherQuantization = bLUTIsLast ? DitherQuantizationValue : 0.0f;
 
 		LP->RenderTargets[0] = FRenderTargetBinding(LUTOutputTarget.Texture, LUTOutputTarget.LoadAction);
 
@@ -1723,7 +1830,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			VignetteOutputTarget = FScreenPassRenderTarget(
 				GraphBuilder.CreateTexture(
 					FRDGTextureDesc::Create2D(
-						ViewportSize, SceneColor.Texture->Desc.Format,
+						ViewportSize, PF_FloatRGBA,
 						FClearValueBinding::None,
 						TexCreate_ShaderResource | TexCreate_RenderTargetable),
 					TEXT("ToneMap.PreHDREncode")),
@@ -1785,6 +1892,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			VP->AlphaTexture = OutputTarget.Texture;
 		}
 		VP->AlphaSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		VP->DitherQuantization = bVignetteIsLast ? DitherQuantizationValue : 0.0f;
 
 		VP->RenderTargets[0] = FRenderTargetBinding(VignetteOutputTarget.Texture, VignetteOutputTarget.LoadAction);
 
@@ -1833,6 +1941,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		HP->OutputDeviceType = (float)HDROutputDevice;
 		HP->PaperWhiteNits   = ActiveComp->PaperWhiteNits;
 		HP->MaxDisplayNits   = HDRMaxDisplayNits;
+		HP->DitherQuantization = bHDREncodeIsLast ? DitherQuantizationValue : 0.0f;
 
 		HP->RenderTargets[0] = FRenderTargetBinding(FinalOutputTarget.Texture, FinalOutputTarget.LoadAction);
 

@@ -23,6 +23,14 @@ FScreenTransform SvPositionToSceneColorUV;
 float OutputDeviceType;  // EDisplayOutputFormat cast to float
 float PaperWhiteNits;    // User-configurable paper-white brightness (default 200)
 float MaxDisplayNits;    // Peak display luminance from OS/driver
+float DitherQuantization; // 0 = off, 1/1023 = 10-bit PQ, etc.
+
+// Interleaved gradient noise (Jimenez 2014)
+float IGNoise(float2 screenPos)
+{
+	float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+	return frac(magic.z * frac(dot(screenPos, magic.xy)));
+}
 
 // ============================================================================
 // Output device IDs (mirrors EDisplayOutputFormat)
@@ -109,7 +117,17 @@ void HDREncodePS(
 		nits = max(nits, 0.0);
 
 		// Apply ST2084 Perceptual Quantizer encoding
-		OutColor = float4(LinearToST2084(nits), 1.0);
+		float3 pq = LinearToST2084(nits);
+
+		// Dithering in PQ space (10-bit target: DitherQuantization = 1/1023)
+		if (DitherQuantization > 0.0)
+		{
+			float n1 = IGNoise(SvPosition.xy);
+			float n2 = IGNoise(SvPosition.xy + float2(47.0, 17.0));
+			pq += (n1 + n2 - 1.0) * DitherQuantization;
+		}
+
+		OutColor = float4(pq, 1.0);
 	}
 	else if (OutputDeviceType > 4.5 && OutputDeviceType < 6.5)
 	{
@@ -132,6 +150,13 @@ void HDREncodePS(
 		// This path should not normally be reached (the HDR encode pass
 		// is only added when the display is HDR), but provides a safe
 		// identity fallback: output the sRGB input unchanged.
-		OutColor = float4(srgb, 1.0);
+		float3 sdrOut = srgb;
+		if (DitherQuantization > 0.0)
+		{
+			float n1 = IGNoise(SvPosition.xy);
+			float n2 = IGNoise(SvPosition.xy + float2(47.0, 17.0));
+			sdrOut += (n1 + n2 - 1.0) * DitherQuantization;
+		}
+		OutColor = float4(sdrOut, 1.0);
 	}
 }

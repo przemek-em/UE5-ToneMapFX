@@ -8,17 +8,15 @@
 #include "ScreenPass.h"
 
 // =============================================================================
-// LUT — Color Grading Look-Up Table
-//   Applies a standard UE LUT texture (256×16 / 1024×32 / 4096×64 unwrapped,
-//   or any Size²×Size strip) as a post-tonemap color grading step.
-//   Input: sRGB display-referred scene color
-//   Output: LUT-graded sRGB color
+// Sharpening — Unsharp mask via 9-tap kernel
+//   Amount: strength of sharpening (0-100)
+//   Radius: pixel radius for neighbor sampling (0.5-5.0)
 // =============================================================================
-class FToneMapLUTPS : public FGlobalShader
+class FToneMapSharpenPS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FToneMapLUTPS);
-	SHADER_USE_PARAMETER_STRUCT(FToneMapLUTPS, FGlobalShader);
+	DECLARE_GLOBAL_SHADER(FToneMapSharpenPS);
+	SHADER_USE_PARAMETER_STRUCT(FToneMapSharpenPS, FGlobalShader);
 
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
@@ -26,12 +24,9 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneColorSampler)
 		SHADER_PARAMETER(FScreenTransform, SvPositionToSceneColorUV)
 
-		// LUT texture and sampling parameters
-		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, LUTTexture)
-		SHADER_PARAMETER_SAMPLER(SamplerState, LUTSampler)
-		SHADER_PARAMETER(float, LUTSize)      // Cube dimension (16, 32, or 64)
-		SHADER_PARAMETER(float, InvLUTSize)    // 1.0 / LUTSize
-		SHADER_PARAMETER(float, LUTIntensity)  // 0 = bypass, 1 = full LUT
+		SHADER_PARAMETER(float, SharpenAmount)
+		SHADER_PARAMETER(float, SharpenRadius)
+		SHADER_PARAMETER(FVector2f, TexelSize)
 		SHADER_PARAMETER(float, DitherQuantization) // 0=off, 1/255=8-bit, 1/1023=10-bit
 
 		RENDER_TARGET_BINDING_SLOTS()

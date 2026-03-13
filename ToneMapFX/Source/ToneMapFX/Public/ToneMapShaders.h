@@ -148,6 +148,7 @@ public:
 		// Feature toggles
 		SHADER_PARAMETER(float, bEnableHSL)
 		SHADER_PARAMETER(float, bEnableCurves)
+		SHADER_PARAMETER(float, DitherQuantization) // 0=off, 1/255=8-bit, 1/1023=10-bit
 
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()

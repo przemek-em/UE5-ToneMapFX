@@ -38,7 +38,7 @@ Runs **after** UE's built-in tonemapper on the already-processed LDR image. Safe
 - **Tint** - Green <-> Magenta
 
 ### Tone
-- **Exposure** - Photographic stops (+/-5 EV)
+- **Exposure** - Photographic stops (+/-20 EV)
 - **Contrast** - With adjustable midpoint pivot
 - **Highlights / Shadows / Whites / Blacks** - Independent tonal band controls
 - **Tone Smoothing** - How smoothly bands overlap
@@ -96,6 +96,15 @@ Four bloom styles:
 
 **Directional Glare** now supports configurable sample count (8–64) for quality/performance trade-off.
 
+### Sharpening
+Post-tonemapping unsharp mask to restore perceived detail after tone curves and color grading.
+
+- **Enable Sharpening** — toggles the sharpening pass on/off
+- **Sharpen Amount** (0–100) — intensity of the unsharp mask, default 50
+- **Sharpen Radius** (0.5–5.0) — sampling radius in pixels, default 1.0
+
+Uses a 9-tap kernel (center + 8 cross/diagonal neighbors). Placed after ToneMapProcess and before LUT in the pipeline.
+
 ### Additional Lens Effects *(available in both modes)*
 
 | Effect | Description |
@@ -111,7 +120,7 @@ Screen-space darkening or lightening from edges with full creative control.
 - **Signed intensity** - Positive darkens edges, negative lightens edges
 - **Alpha texture mask** - Use any texture channel (R/G/B/A) as a custom vignette shape
 - **Texture-only mode** - Bypass procedural vignette entirely; scene is multiplied by texture mask
-- Blue-noise dithering eliminates banding in smooth gradients
+- Triangular-PDF dithering eliminates banding in smooth gradients
 
 ### HDR Output *(Replace Tonemapper Mode)*
 Optional HDR monitor support for the Replace Tonemapper pipeline.
@@ -144,8 +153,16 @@ Save and load all ToneMapFX settings to `.txt` files using OS native file dialog
 - **Disable Unreal Bloom** - Zeros UE's `BloomIntensity` to prevent double-bloom when using ToneMapFX bloom (enabled by default)
 - **Automatic Exposure Neutralization** - When exposure mode is *Krawczyk* or *None*, UE's entire exposure system is disabled (see Auto-Exposure section)
 
+### Output Dithering
+Automatic last-pass dithering to eliminate color banding in smooth gradients (skies, dark scenes).
+
+- **Enable Dithering** — toggle in Advanced category (enabled by default)
+- Quantum auto-detection: **1/255** for SDR output (safe for 8-bit and 10-bit displays), **1/1023** for HDR PQ, disabled for scRGB float
+- Applied only in the **last active pass** of the pipeline to avoid cumulative noise
+- All intermediate render targets use `PF_FloatRGBA` (16-bit float) to preserve precision between passes
+
 ### Camera Settings
-Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure derived from real-world camera parameters.
+Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), **Aperture** - for exposure derived from real-world camera parameters. Standard photographic stops listed in tooltips.
 
 
 ---
@@ -164,10 +181,12 @@ Physical camera model - **ISO**, **Shutter Speed**, **Aperture** - for exposure 
 - [x] ~~LUT import~~ *(done — 16³/32³/64³ LUT color grading)*
 - [x] ~~Bloom bugfixes~~ *(done — soft-knee threshold, MaxBrightness clamp, PF_FloatRGBA)*
 - [x] ~~HDR monitor output~~ *(done — ST2084/PQ + scRGB encoding, Paper White Nits, auto CVar toggle)*
-- [ ] Camera Exposure settings - fix values
+- [x] ~~Camera Exposure settings~~ *(done — ShutterSpeedDenominator 1/X notation, EV100 inversion fix, standard stop tooltips)*
+- [x] ~~Sharpen~~ *(done — 9-tap unsharp mask with configurable amount and pixel radius)*
+- [x] ~~Anti-banding / Dithering~~ *(done — last-pass-only dithering, PF_FloatRGBA intermediates, triangular-PDF noise, quantum auto-detect)*
+- [x] ~~Krawczyk flickering fix~~ *(done — DeltaTime clamped to 66ms)*
 - [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves
-- [ ] Sharpen, additional mode for pixel radius
 - [ ] Texture overlay
 - [ ] Custom light shafts
 

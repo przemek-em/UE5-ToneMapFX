@@ -51,6 +51,7 @@ float  bAlphaTextureOnly;   // > 0.5 = skip procedural vignette, use texture onl
 float  TextureChannelIndex; // 0=Alpha, 1=Red, 2=Green, 3=Blue
 Texture2D    AlphaTexture;
 SamplerState AlphaSampler;
+float DitherQuantization; // 0 = off, 1/255 = 8-bit, 1/1023 = 10-bit
 
 void VignettePS(
 	float4 SvPosition : SV_Position,
@@ -66,9 +67,15 @@ void VignettePS(
 	float absIntensity = abs(rawIntensity) / 100.0;  // 0..1
 	bool  bDarken      = (rawIntensity >= 0.0);
 
-	// Dither value: ±0.5/255 triangular noise to break banding
-	float noise = InterleavedGradientNoise(SvPosition.xy);
-	float dither = (noise - 0.5) / 255.0;
+	// Dither value: triangular noise to break banding (two noise samples → triangle PDF)
+	// Only applied when this is the last pass (DitherQuantization > 0)
+	float dither = 0.0;
+	if (DitherQuantization > 0.0)
+	{
+		float noise1 = InterleavedGradientNoise(SvPosition.xy);
+		float noise2 = InterleavedGradientNoise(SvPosition.xy + float2(47.0, 17.0));
+		dither = (noise1 + noise2 - 1.0) * DitherQuantization;
+	}
 
 	// ── Alpha texture sampling (channel-selectable) ────────────────────
 	float texAlpha = 1.0;

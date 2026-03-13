@@ -1,0 +1,68 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// ============================================================================
+// Unsharp Mask Sharpening
+//
+// 9-tap kernel: 4 cardinal + 4 diagonal neighbors weighted to approximate
+// a small Gaussian blur, then subtracts from original to extract detail.
+// Bilinear sampling allows sub-pixel radius control.
+// ============================================================================
+
+Texture2D    SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+
+float SharpenAmount;   // 0 .. 100
+float SharpenRadius;   // 0.5 .. 5.0 pixels
+float2 TexelSize;      // 1/width, 1/height
+float DitherQuantization; // 0 = off, 1/255 = 8-bit, 1/1023 = 10-bit
+
+// Interleaved gradient noise (Jimenez 2014)
+float IGNoise(float2 screenPos)
+{
+	float3 magic = float3(0.06711056, 0.00583715, 52.9829189);
+	return frac(magic.z * frac(dot(screenPos, magic.xy)));
+}
+
+void SharpenPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 center = Texture2DSample(SceneColorTexture, SceneColorSampler, UV).rgb;
+
+	float2 offset = TexelSize * SharpenRadius;
+
+	// 4 cardinal neighbors (weight 2 each)
+	float3 n0 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2( offset.x, 0)).rgb;
+	float3 n1 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(-offset.x, 0)).rgb;
+	float3 n2 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(0,  offset.y)).rgb;
+	float3 n3 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(0, -offset.y)).rgb;
+
+	// 4 diagonal neighbors (weight 1 each)
+	float3 d0 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2( offset.x,  offset.y)).rgb;
+	float3 d1 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(-offset.x,  offset.y)).rgb;
+	float3 d2 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2( offset.x, -offset.y)).rgb;
+	float3 d3 = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(-offset.x, -offset.y)).rgb;
+
+	// Weighted average: cardinals=2, diagonals=1, total=12
+	float3 blurred = (n0 + n1 + n2 + n3) * 2.0 + (d0 + d1 + d2 + d3);
+	blurred *= (1.0 / 12.0);
+
+	// Unsharp mask: extract detail and add back
+	float3 detail = center - blurred;
+	float3 sharpened = center + detail * (SharpenAmount * 0.01);
+	sharpened = saturate(sharpened);
+
+	// Dithering (last-pass only; quantum set by subsystem)
+	if (DitherQuantization > 0.0)
+	{
+		float n1 = IGNoise(SvPosition.xy);
+		float n2 = IGNoise(SvPosition.xy + float2(47.0, 17.0));
+		sharpened += (n1 + n2 - 1.0) * DitherQuantization;
+	}
+
+	OutColor = float4(sharpened, 1.0);
+}

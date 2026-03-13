@@ -119,6 +119,7 @@ float HSLSmoothing;    // 0 = sharpest cutoff, 100 = smoothest feather
 // Feature toggles
 float bEnableHSL;
 float bEnableCurves;
+float DitherQuantization;
 
 // ============================================================================
 // Utility: Rec.709 luminance
@@ -817,15 +818,15 @@ float InterleavedGradientNoise(float2 uv)
 	return frac(magic.z * frac(dot(uv, magic.xy)));
 }
 
-float3 ApplyDithering(float3 color, float2 svPos)
+float3 ApplyDithering(float3 color, float2 svPos, float quantum)
 {
 	// Triangular distribution: two uniform samples → triangle PDF
 	float noise1 = InterleavedGradientNoise(svPos);
 	float noise2 = InterleavedGradientNoise(svPos + float2(47.0, 17.0));
 	float triangleNoise = noise1 + noise2 - 1.0; // range [-1, 1]
 
-	// Scale to half an 8-bit LSB
-	return color + triangleNoise / 255.0;
+	// Scale to output format quantum (1/255 for 8-bit, 1/1023 for 10-bit)
+	return color + triangleNoise * quantum;
 }
 
 void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
@@ -988,8 +989,9 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 		color = saturate(color);
 		color = LinearToSRGB(color);
 
-		// --- 17. Dithering (reduce 8-bit banding) ---
-		color = ApplyDithering(color, SvPosition.xy);
+		// --- 17. Dithering (last-pass only; quantum set by subsystem) ---
+		if (DitherQuantization > 0.0)
+			color = ApplyDithering(color, SvPosition.xy, DitherQuantization);
 
 		// Clamp final output
 		color = saturate(color);
@@ -1070,6 +1072,10 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 		{
 			color = ApplyToneCurve(color, ToneCurveParams);
 		}
+
+		// --- 10. Dithering (last-pass only; quantum set by subsystem) ---
+		if (DitherQuantization > 0.0)
+			color = ApplyDithering(color, SvPosition.xy, DitherQuantization);
 
 		// Clamp to prevent negative values after all processing
 		color = max(color, 0.0);
