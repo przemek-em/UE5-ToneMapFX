@@ -185,6 +185,8 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - [x] ~~Sharpen~~ *(done — 9-tap unsharp mask with configurable amount and pixel radius)*
 - [x] ~~Anti-banding / Dithering~~ *(done — last-pass-only dithering, PF_FloatRGBA intermediates, triangular-PDF noise, quantum auto-detect)*
 - [x] ~~Krawczyk flickering fix~~ *(done — DeltaTime clamped to 66ms)*
+- [ ] LUT baking — collapse per-pixel color transforms into a single 3D LUT lookup (performance optimization, even better banding fixes)
+- [ ] LUT export
 - [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves
 - [ ] Texture overlay
