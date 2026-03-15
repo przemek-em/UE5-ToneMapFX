@@ -105,6 +105,14 @@ Post-tonemapping unsharp mask to restore perceived detail after tone curves and 
 
 Uses a 9-tap kernel (center + 8 cross/diagonal neighbors). Placed after ToneMapProcess and before LUT in the pipeline.
 
+### Processing Path (LUT Mode)
+Optional dual-path architecture for the main color grading pass.
+
+- **Per-Pixel (Full Quality)** — default. Every color operation evaluated analytically per screen pixel.
+- **LUT (Performance)** — bakes 14 non-spatial color operations (WhiteBalance, Exposure, Contrast, HSL, Vibrance, Saturation, Film Curve, Tone Curve, etc.) into a 32×32×32 3D LUT. Each pixel does a single trilinear texture fetch instead of the full math chain. Spatial operations (Clarity, Dynamic Contrast) still run per-pixel after the LUT lookup.
+
+Both paths produce virtually identical visual output. The LUT path trades ALU for texture bandwidth — a GPU performance win on complex grading setups.
+
 ### Additional Lens Effects *(available in both modes)*
 
 | Effect | Description |
@@ -152,14 +160,17 @@ Save and load all ToneMapFX settings to `.txt` files using OS native file dialog
 ### Engine Overrides
 - **Disable Unreal Bloom** - Zeros UE's `BloomIntensity` to prevent double-bloom when using ToneMapFX bloom (enabled by default)
 - **Automatic Exposure Neutralization** - When exposure mode is *Krawczyk* or *None*, UE's entire exposure system is disabled (see Auto-Exposure section)
+- **Force FP16 Pipeline** - Forces UE's entire post-processing chain to use `PF_FloatRGBA` (FP16, 64bpp) precision by toggling `r.PostProcessing.PropagateAlpha` at runtime. Prevents banding from 10-bit/11-bit quantization in TAA/TSR and tonemapper output. Enabled by default. Doubles bandwidth of post-process passes — small cost on modern hardware, significant quality improvement in smooth gradients.
 
 ### Output Dithering
 Automatic last-pass dithering to eliminate color banding in smooth gradients (skies, dark scenes).
 
 - **Enable Dithering** — toggle in Advanced category (enabled by default)
-- Quantum auto-detection: **1/255** for SDR output (safe for 8-bit and 10-bit displays), **1/1023** for HDR PQ, disabled for scRGB float
+- **Dither Quantization** — adjustable noise amplitude (default `1/255 ≈ 0.00392` for 8-bit). Set `1/1023 ≈ 0.00098` for 10-bit panels, or increase for more aggressive banding removal.
+- Quantum auto-detection for HDR: disabled for scRGB float, applies configured value for SDR/PQ
 - Applied only in the **last active pass** of the pipeline to avoid cumulative noise
 - All intermediate render targets use `PF_FloatRGBA` (16-bit float) to preserve precision between passes
+- Uses **triangular-PDF dithering** (two samples of Interleaved Gradient Noise, Jimenez 2014) — quieter to the eye than uniform dithering with the same banding-breaking effectiveness
 
 ### Camera Settings
 Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), **Aperture** - for exposure derived from real-world camera parameters. Standard photographic stops listed in tooltips.
@@ -185,7 +196,9 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - [x] ~~Sharpen~~ *(done — 9-tap unsharp mask with configurable amount and pixel radius)*
 - [x] ~~Anti-banding / Dithering~~ *(done — last-pass-only dithering, PF_FloatRGBA intermediates, triangular-PDF noise, quantum auto-detect)*
 - [x] ~~Krawczyk flickering fix~~ *(done — DeltaTime clamped to 66ms)*
-- [ ] LUT baking — collapse per-pixel color transforms into a single 3D LUT lookup (performance optimization, even better banding fixes)
+- [x] ~~LUT Processing Path~~ *(done — 32³ baked LUT mode, dual-path Per-Pixel/LUT, CombineLUT+ApplyLUT shaders)*
+- [x] ~~FP16 Pipeline Override~~ *(done — Force FP16 Pipeline checkbox, r.PostProcessing.PropagateAlpha toggle, eliminates 10-bit/11-bit quantization)*
+- [x] ~~Dither Quantization Control~~ *(done — user-adjustable noise quantum slider, default 1/255)*
 - [ ] LUT export
 - [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves

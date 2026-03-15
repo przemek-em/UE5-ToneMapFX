@@ -10,6 +10,7 @@
 #include "ToneMapVignetteShaders.h"
 #include "ToneMapSharpenShaders.h"
 #include "ToneMapLUTShaders.h"
+#include "ToneMapCombineLUTShaders.h"
 #include "SceneView.h"
 #include "SceneRendering.h"
 #include "ScreenPass.h"
@@ -59,6 +60,21 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 					if (CVarHDR->GetInt() != DesiredValue)
 					{
 						CVarHDR->Set(DesiredValue, ECVF_SetByCode);
+					}
+				}
+			}
+
+			// Auto-toggle r.PostProcessing.PropagateAlpha to force FP16 precision
+			// through the entire post-process chain (TAA/TSR, tonemapper output).
+			// Prevents 10-bit/11-bit quantization banding at source.
+			{
+				static IConsoleVariable* CVarPropAlpha = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PostProcessing.PropagateAlpha"));
+				if (CVarPropAlpha)
+				{
+					const int32 DesiredValue = Ptr->bForceFP16Pipeline ? 1 : 0;
+					if (CVarPropAlpha->GetInt() != DesiredValue)
+					{
+						CVarPropAlpha->Set(DesiredValue, ECVF_SetByCode);
 					}
 				}
 			}
@@ -1436,13 +1452,12 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 		if (!bIsHDRLinear)
 		{
-			// Default to 8-bit quantum — safe for both 8-bit and 10-bit displays.
-			// On 10-bit panels the added noise is ~¼ LSB, imperceptible.
-			DitherQuantizationValue = 1.0f / 255.0f;
+			DitherQuantizationValue = ActiveComp->DitherQuantization;
 		}
 	}
 
 	// Determine which pass is last in the chain (only it receives dithering)
+	const bool bUseLUTPath = (ActiveComp->ProcessingPath == EToneMapProcessingPath::LUT);
 	const bool bToneMapIsLast  = !bNeedSharpening && !bNeedLUT && !bNeedVignette && !bNeedHDREncode;
 	const bool bSharpenIsLast  = bNeedSharpening && !bNeedLUT && !bNeedVignette && !bNeedHDREncode;
 	const bool bLUTIsLast      = bNeedLUT && !bNeedVignette && !bNeedHDREncode;
@@ -1464,10 +1479,14 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	}
 
 	// =====================================================================
-	// Main Tone Map processing pass
+	// Main Tone Map processing pass (dual-path: Per-Pixel vs LUT)
 	// =====================================================================
 
+	if (!bUseLUTPath)
 	{
+		// =================================================================
+		// PER-PIXEL PATH — existing single-pass processing
+		// =================================================================
 		auto* P = GraphBuilder.AllocParameters<FToneMapProcessPS::FParameters>();
 		P->View              = ViewInfo.ViewUniformBuffer;
 		P->SceneColorTexture = SceneColor.Texture;
@@ -1680,6 +1699,246 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			RDG_EVENT_NAME("ToneMapProcess"),
 			ProcessShader, P,
 			OutputTarget.ViewRect);
+	}
+	else
+	{
+		// =================================================================
+		// LUT PATH — Bake non-spatial ops into 32^3 LUT, then apply
+		// =================================================================
+		const float LUTDim = 32.0f;
+		const FIntPoint LUTTextureSize(
+			(int32)(LUTDim * LUTDim),  // 1024
+			(int32)LUTDim);            // 32
+
+		// --- Step 1: Generate the baked LUT ---
+		FRDGTextureRef BakedLUTTexture = GraphBuilder.CreateTexture(
+			FRDGTextureDesc::Create2D(
+				LUTTextureSize, PF_FloatRGBA,
+				FClearValueBinding::None,
+				TexCreate_ShaderResource | TexCreate_RenderTargetable),
+			TEXT("ToneMap.BakedLUT"));
+
+		{
+			auto* LP = GraphBuilder.AllocParameters<FToneMapCombineLUTPS::FParameters>();
+			LP->View = ViewInfo.ViewUniformBuffer;
+			LP->LUTSize = LUTDim;
+			LP->bReplaceTonemap = bIsReplaceTonemap ? 1.0f : 0.0f;
+
+			// Film Curve
+			LP->FilmCurveMode = (float)static_cast<uint8>(ActiveComp->FilmCurve);
+			LP->HableParams1 = FVector4f(
+				ActiveComp->HableShoulderStrength,
+				ActiveComp->HableLinearStrength,
+				ActiveComp->HableLinearAngle,
+				ActiveComp->HableToeStrength);
+			LP->HableParams2 = FVector4f(
+				ActiveComp->HableToeNumerator,
+				ActiveComp->HableToeDenominator,
+				ActiveComp->HableWhitePoint,
+				0.0f);
+			LP->ReinhardWhitePoint = ActiveComp->ReinhardWhitePoint;
+			LP->HDRSaturation = ActiveComp->HDRSaturation;
+			LP->HDRColorBalance = FVector3f(
+				ActiveComp->HDRColorBalance.R,
+				ActiveComp->HDRColorBalance.G,
+				ActiveComp->HDRColorBalance.B);
+			LP->AgXParams = FVector4f(
+				ActiveComp->AgXMinEV,
+				ActiveComp->AgXMaxEV,
+				(float)static_cast<uint8>(ActiveComp->AgXLook),
+				0.0f);
+			LP->bPreToneMapped = bPreToneMapped ? 1.0f : 0.0f;
+
+			// White Balance
+			LP->Temperature = ActiveComp->bEnableWhiteBalance ? ActiveComp->Temperature : 0.0f;
+			LP->Tint        = ActiveComp->bEnableWhiteBalance ? ActiveComp->Tint : 0.0f;
+
+			// Exposure
+			LP->ExposureValue = ActiveComp->Exposure;
+			float CameraEVLUT = 0.0f;
+			if (ActiveComp->bUseCameraExposure)
+			{
+				float N = FMath::Max(ActiveComp->Aperture, 1.0f);
+				float t = 1.0f / FMath::Max(ActiveComp->ShutterSpeedDenominator, 1.0f);
+				float S = FMath::Max(ActiveComp->CameraISO, 1.0f);
+				float EV100 = FMath::Log2(N * N / t) + FMath::Log2(100.0f / S);
+				const float ReferenceEV = FMath::Log2(5.6f * 5.6f / (1.0f / 125.0f)) + FMath::Log2(100.0f / 100.0f);
+				CameraEVLUT = ReferenceEV - EV100;
+			}
+			LP->CameraEV = CameraEVLUT;
+			LP->bUseCameraExposure = ActiveComp->bUseCameraExposure ? 1.0f : 0.0f;
+
+			// Tone
+			LP->Contrast        = ActiveComp->Contrast;
+			LP->HighlightsValue = ActiveComp->bEnableToneAdjustments ? ActiveComp->Highlights : 0.0f;
+			LP->ShadowsValue    = ActiveComp->bEnableToneAdjustments ? ActiveComp->Shadows : 0.0f;
+			LP->WhitesValue     = ActiveComp->bEnableToneAdjustments ? ActiveComp->Whites : 0.0f;
+			LP->BlacksValue     = ActiveComp->bEnableToneAdjustments ? ActiveComp->Blacks : 0.0f;
+			LP->ToneSmoothingValue = ActiveComp->ToneSmoothing;
+			LP->ContrastMidpoint   = ActiveComp->ContrastMidpoint;
+
+			// Presence (non-spatial)
+			LP->VibranceStrength   = ActiveComp->Vibrance;
+			LP->SaturationStrength = ActiveComp->Saturation;
+
+			// Tone Curve
+			LP->ToneCurveParams = FVector4f(
+				ActiveComp->CurveHighlights,
+				ActiveComp->CurveLights,
+				ActiveComp->CurveDarks,
+				ActiveComp->CurveShadows);
+
+			// HSL
+			LP->HueShift1 = FVector4f(ActiveComp->HueReds, ActiveComp->HueOranges, ActiveComp->HueYellows, ActiveComp->HueGreens);
+			LP->HueShift2 = FVector4f(ActiveComp->HueAquas, ActiveComp->HueBlues, ActiveComp->HuePurples, ActiveComp->HueMagentas);
+			LP->SatAdj1   = FVector4f(ActiveComp->SatReds, ActiveComp->SatOranges, ActiveComp->SatYellows, ActiveComp->SatGreens);
+			LP->SatAdj2   = FVector4f(ActiveComp->SatAquas, ActiveComp->SatBlues, ActiveComp->SatPurples, ActiveComp->SatMagentas);
+			LP->LumAdj1   = FVector4f(ActiveComp->LumReds, ActiveComp->LumOranges, ActiveComp->LumYellows, ActiveComp->LumGreens);
+			LP->LumAdj2   = FVector4f(ActiveComp->LumAquas, ActiveComp->LumBlues, ActiveComp->LumPurples, ActiveComp->LumMagentas);
+			LP->HSLSmoothing = ActiveComp->HSLSmoothing;
+
+			// Feature toggles
+			LP->bEnableHSL    = ActiveComp->IsAnyHSLActive()  ? 1.0f : 0.0f;
+			LP->bEnableCurves = ActiveComp->IsAnyCurveActive() ? 1.0f : 0.0f;
+
+			LP->RenderTargets[0] = FRenderTargetBinding(BakedLUTTexture, ERenderTargetLoadAction::ENoAction);
+
+			TShaderMapRef<FToneMapCombineLUTPS> CombineLUTShader(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(
+				GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("ToneMapCombineLUT"),
+				CombineLUTShader, LP,
+				FIntRect(0, 0, LUTTextureSize.X, LUTTextureSize.Y));
+		}
+
+		// --- Step 2: Apply the baked LUT + spatial ops ---
+		{
+			auto* AP = GraphBuilder.AllocParameters<FToneMapApplyLUTPS::FParameters>();
+			AP->View = ViewInfo.ViewUniformBuffer;
+
+			AP->SceneColorTexture = SceneColor.Texture;
+			AP->SceneColorSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+
+			AP->BakedLUTTexture = BakedLUTTexture;
+			AP->BakedLUTSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			AP->LUTSize = LUTDim;
+			AP->InvLUTSize = 1.0f / LUTDim;
+
+			AP->bReplaceTonemap = bIsReplaceTonemap ? 1.0f : 0.0f;
+
+			// Build screen transforms (same as per-pixel path)
+			const FIntPoint OutputExtent = FIntPoint(OutputTarget.Texture->Desc.Extent.X, OutputTarget.Texture->Desc.Extent.Y);
+			const FIntRect  OutputViewRect = OutputTarget.ViewRect;
+			const FScreenPassTextureViewport OutputVP(OutputExtent, OutputViewRect);
+
+			const FScreenPassTextureViewport SceneColorInputVP(
+				FIntPoint(SceneColor.Texture->Desc.Extent.X, SceneColor.Texture->Desc.Extent.Y),
+				SceneColorViewport.Rect);
+
+			AP->SvPositionToSceneColorUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(SceneColorInputVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+
+			const FScreenPassTextureViewport BlurredVP(
+				ViewportSize, FIntRect(0, 0, ViewportSize.X, ViewportSize.Y));
+
+			AP->SvPositionToBlurredUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(BlurredVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+
+			// Output viewport rect
+			AP->OutputViewportRect = FVector4f(
+				(float)OutputViewRect.Min.X, (float)OutputViewRect.Min.Y,
+				(float)OutputViewRect.Max.X, (float)OutputViewRect.Max.Y);
+
+			// Bloom
+			if (bIsReplaceTonemap && BloomInput.IsValid())
+			{
+				AP->BloomTexture = BloomInput.Texture;
+				AP->BloomSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				const FScreenPassTextureViewport BloomVP(BloomInput);
+				AP->SvPositionToBloomUV = (
+					FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+					FScreenTransform::ChangeTextureBasisFromTo(BloomVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+			}
+			else
+			{
+				AP->BloomTexture = SceneColor.Texture;
+				AP->BloomSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				AP->SvPositionToBloomUV = AP->SvPositionToSceneColorUV;
+			}
+
+			// Exposure removal
+			AP->OneOverPreExposure = 1.0f / FMath::Max(ViewInfo.PreExposure, 0.001f);
+			AP->GlobalExposure = FMath::Max(View.GetLastEyeAdaptationExposure(), 0.001f);
+
+			// Auto-Exposure
+			AP->AutoExposureMode = (float)static_cast<uint8>(ActiveComp->AutoExposureMode);
+			if (bNeedKrawczyk && AdaptedLumTexture)
+			{
+				AP->AdaptedLumTexture = AdaptedLumTexture;
+			}
+			else
+			{
+				AP->AdaptedLumTexture = SceneColor.Texture;
+			}
+			AP->AdaptedLumSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			AP->MinAutoExposure = ActiveComp->MinAutoExposure;
+			AP->MaxAutoExposure = ActiveComp->MaxAutoExposure;
+
+			// Clarity blur
+			AP->BlurredTexture = BlurredTexture;
+			AP->BlurredSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			AP->ClarityStrength = ActiveComp->Clarity;
+
+			// Dynamic Contrast blur textures
+			AP->BlurredFineTexture = BlurredFineTexture;
+			AP->BlurredFineSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			AP->BlurredCoarseTexture = BlurredCoarseTexture;
+			AP->BlurredCoarseSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			AP->SvPositionToBlurredFineUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(BlurredVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+			AP->SvPositionToBlurredCoarseUV = (
+				FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+				FScreenTransform::ChangeTextureBasisFromTo(BlurredVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+
+			AP->DynamicContrastStrength  = ActiveComp->DynamicContrast;
+			AP->CorrectContrastStrength  = ActiveComp->CorrectContrast;
+			AP->CorrectColorCastStrength = ActiveComp->CorrectColorCast;
+
+			// Pre-tone-mapped (Durand/Fattal)
+			AP->bPreToneMapped = bPreToneMapped ? 1.0f : 0.0f;
+			if (bPreToneMapped && PreToneMappedTexture)
+			{
+				AP->PreToneMappedTexture = PreToneMappedTexture;
+				AP->PreToneMappedSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				const FScreenPassTextureViewport PreTMVP(
+					FIntPoint(PreToneMappedTexture->Desc.Extent.X, PreToneMappedTexture->Desc.Extent.Y),
+					FIntRect(0, 0, PreToneMappedTexture->Desc.Extent.X, PreToneMappedTexture->Desc.Extent.Y));
+				AP->SvPositionToPreToneMappedUV = (
+					FScreenTransform::ChangeTextureBasisFromTo(OutputVP, FScreenTransform::ETextureBasis::TexelPosition, FScreenTransform::ETextureBasis::ViewportUV) *
+					FScreenTransform::ChangeTextureBasisFromTo(PreTMVP, FScreenTransform::ETextureBasis::ViewportUV, FScreenTransform::ETextureBasis::TextureUV));
+			}
+			else
+			{
+				AP->PreToneMappedTexture = SceneColor.Texture;
+				AP->PreToneMappedSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+				AP->SvPositionToPreToneMappedUV = AP->SvPositionToSceneColorUV;
+			}
+
+			// Dithering
+			AP->DitherQuantization = bToneMapIsLast ? DitherQuantizationValue : 0.0f;
+
+			AP->RenderTargets[0] = FRenderTargetBinding(OutputTarget.Texture, OutputTarget.LoadAction);
+
+			TShaderMapRef<FToneMapApplyLUTPS> ApplyLUTShader(ViewInfo.ShaderMap);
+			FPixelShaderUtils::AddFullscreenPass(
+				GraphBuilder, ViewInfo.ShaderMap,
+				RDG_EVENT_NAME("ToneMapApplyLUT"),
+				ApplyLUTShader, AP,
+				OutputTarget.ViewRect);
+		}
 	}
 
 	// =====================================================================

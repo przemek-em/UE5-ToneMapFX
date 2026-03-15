@@ -117,6 +117,16 @@ enum class EToneMapAutoExposure : uint8
 		ToolTip = "(EXPERIMENTAL) Krawczyk et al. 2005: automatic scene key estimation from log-average luminance. UE's built-in exposure is disabled automatically.")
 };
 
+/** Processing path: how color grading operations are evaluated */
+UENUM(BlueprintType)
+enum class EToneMapProcessingPath : uint8
+{
+	PerPixel  UMETA(DisplayName = "Per-Pixel (Full Quality)",
+		ToolTip = "Every color operation evaluated analytically per screen pixel. Maximum mathematical precision."),
+	LUT       UMETA(DisplayName = "LUT (Performance)",
+		ToolTip = "Non-spatial operations baked into a 32x32x32 3D LUT, sampled with one trilinear fetch per pixel. Trades ALU for texture bandwidth — same visual quality with lower GPU cost. Use Dither Quantization for anti-banding.")
+};
+
 // ============================================================================
 // Vignette enums
 // ============================================================================
@@ -521,6 +531,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced")
 	EToneMapMode Mode = EToneMapMode::PostProcess;
 
+	/** Processing path: Per-Pixel evaluates all color math analytically per pixel;
+	    LUT bakes non-spatial operations into a 32^3 3D lookup table for lower GPU cost
+	    with virtually identical visual output. Both paths produce the same result. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced")
+	EToneMapProcessingPath ProcessingPath = EToneMapProcessingPath::PerPixel;
+
 	/** Where in the post-process pipeline to inject (PostProcess mode only). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced",
 		meta=(EditCondition = "Mode == EToneMapMode::PostProcess"))
@@ -530,6 +546,23 @@ public:
 	    Active in both modes — prevents visible gradient steps on smooth areas (sky, fog). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced")
 	bool bEnableDithering = true;
+
+	/** Dither noise quantum — controls the amplitude of the dithering noise.
+	    1/255 ≈ 0.00392 (8-bit, default) — safe for 8-bit and 10-bit displays.
+	    1/1023 ≈ 0.00098 (10-bit) — minimal noise, use on 10-bit panels.
+	    Higher values = stronger noise, more aggressive banding removal.
+	    0 = no dithering even when enabled. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced",
+		meta=(EditCondition = "bEnableDithering",
+		      ClampMin = "0.0", ClampMax = "0.02", UIMin = "0.0", UIMax = "0.02"))
+	float DitherQuantization = 1.0f / 255.0f;
+
+	/** Force the entire UE post-processing pipeline to use FP16 (64bpp) precision.
+	    Prevents banding from 10-bit/11-bit quantization in TAA/TSR and tonemapper
+	    output.  Doubles bandwidth of all post-process passes — small GPU cost on
+	    modern hardware.  Sets r.PostProcessing.PropagateAlpha at runtime. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced")
+	bool bForceFP16Pipeline = true;
 
 	// =========================================================================
 	// Auto-Exposure (ReplaceTonemap mode only)

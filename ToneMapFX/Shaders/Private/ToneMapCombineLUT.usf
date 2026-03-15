@@ -1,0 +1,580 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// ============================================================================
+// ToneMapFX — Combined LUT Generation Shader
+//
+// Bakes all non-spatial color operations into a 32^3 (1024x32) 3D LUT.
+// Runs once per frame (or when parameters change) on a 1024x32 quad.
+// The LUT is then sampled at runtime with a single trilinear fetch per pixel.
+//
+// Operations baked:
+//   WhiteBalance → Exposure → ToneAdjustments → Contrast → HSL →
+//   Vibrance → Saturation → HDR Sat/Color → Film Curve → Tone Curve → sRGB
+//
+// Operations NOT baked (spatial/temporal, handled by ToneMapApplyLUT.usf):
+//   Auto-Exposure, Bloom composite, Clarity, Dynamic Contrast, Dithering
+// ============================================================================
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+// ============================================================================
+// Shader Parameters
+// ============================================================================
+
+float LUTSize;  // 32.0
+
+// Mode: 0 = PostProcess (LDR input), 1 = ReplaceTonemap (HDR input)
+float bReplaceTonemap;
+
+// Film Curve params (ReplaceTonemap mode)
+float  FilmCurveMode;
+float4 HableParams1;
+float4 HableParams2;
+float  ReinhardWhitePoint;
+float  HDRSaturation;
+float3 HDRColorBalance;
+float4 AgXParams;
+float  bPreToneMapped;
+
+// White Balance
+float Temperature;
+float Tint;
+
+// Exposure
+float ExposureValue;
+float CameraEV;
+float bUseCameraExposure;
+
+// Tone
+float Contrast;
+float HighlightsValue;
+float ShadowsValue;
+float WhitesValue;
+float BlacksValue;
+float ToneSmoothingValue;
+float ContrastMidpoint;
+
+// Presence (non-spatial only)
+float VibranceStrength;
+float SaturationStrength;
+
+// Tone Curve
+float4 ToneCurveParams;
+
+// HSL
+float4 HueShift1;
+float4 HueShift2;
+float4 SatAdj1;
+float4 SatAdj2;
+float4 LumAdj1;
+float4 LumAdj2;
+float  HSLSmoothing;
+
+// Feature toggles
+float bEnableHSL;
+float bEnableCurves;
+
+// ============================================================================
+// Copy of all non-spatial functions from ToneMapProcess.usf
+// These are pure f(color, params) → color transforms.
+// ============================================================================
+
+float Luma(float3 c)
+{
+	return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+float3 ApplyWhiteBalance(float3 color, float temp, float tint)
+{
+	float t = temp * 0.01;
+	float n = tint * 0.01;
+	float3 balance;
+	balance.r = 1.0 + t * 0.15;
+	balance.g = 1.0 - abs(t) * 0.03 - n * 0.10;
+	balance.b = 1.0 - t * 0.15;
+	return max(color * balance, 0.0);
+}
+
+float3 ApplyExposure(float3 color, float ev)
+{
+	return color * exp2(ev);
+}
+
+float3 ApplyToneAdjustments(float3 color, float highlights, float shadows,
+							float whites, float blacks, float toneSmooth)
+{
+	float luma  = Luma(color);
+	float mapped = saturate(luma);
+	float f = saturate(toneSmooth * 0.01);
+
+	float hlLo = lerp(0.60, 0.25, f);
+	float hlHi = lerp(0.75, 0.95, f);
+	float highlightMask = smoothstep(hlLo, hlHi, mapped);
+
+	float shLo = lerp(0.25, 0.05, f);
+	float shHi = lerp(0.40, 0.75, f);
+	float shadowMask = 1.0 - smoothstep(shLo, shHi, mapped);
+
+	float whLo = lerp(0.85, 0.55, f);
+	float whHi = lerp(0.95, 1.00, f);
+	float whiteMask = smoothstep(whLo, whHi, mapped);
+
+	float bkHi = lerp(0.12, 0.45, f);
+	float blackMask = 1.0 - smoothstep(0.00, bkHi, mapped);
+
+	float adj = 1.0;
+	adj += highlights * 0.01 * highlightMask;
+	adj += shadows   * 0.01 * shadowMask;
+	adj += whites    * 0.01 * whiteMask;
+	adj += blacks    * 0.01 * blackMask;
+
+	return max(color * adj, 0.0);
+}
+
+float3 ApplyContrast(float3 color, float contrast, float midpoint)
+{
+	if (abs(contrast) < 0.01)
+		return color;
+
+	float c = 1.0 + contrast * 0.01;
+	float3 sign_c = sign(color);
+	float3 abs_c  = max(abs(color), 0.0001);
+	float3 result  = sign_c * midpoint * pow(abs_c / midpoint, c);
+	return result;
+}
+
+// --- HSL ---
+float3 RGBToHSL(float3 color)
+{
+	float maxC  = max(color.r, max(color.g, color.b));
+	float minC  = min(color.r, min(color.g, color.b));
+	float delta = maxC - minC;
+	float L = (maxC + minC) * 0.5;
+	float S = 0.0;
+	float H = 0.0;
+	if (delta > 0.0001)
+	{
+		S = (L > 0.5) ? delta / (2.0 - maxC - minC) : delta / (maxC + minC);
+		if (maxC == color.r)
+			H = (color.g - color.b) / delta + (color.g < color.b ? 6.0 : 0.0);
+		else if (maxC == color.g)
+			H = (color.b - color.r) / delta + 2.0;
+		else
+			H = (color.r - color.g) / delta + 4.0;
+		H /= 6.0;
+	}
+	return float3(H, S, L);
+}
+
+float HueToChannel(float p, float q, float t)
+{
+	if (t < 0.0) t += 1.0;
+	if (t > 1.0) t -= 1.0;
+	if (t < 1.0 / 6.0) return p + (q - p) * 6.0 * t;
+	if (t < 0.5)        return q;
+	if (t < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+	return p;
+}
+
+float3 HSLToRGB(float3 hsl)
+{
+	float H = hsl.x, S = hsl.y, L = hsl.z;
+	if (S < 0.0001)
+		return float3(L, L, L);
+	float q = (L < 0.5) ? L * (1.0 + S) : L + S - L * S;
+	float p = 2.0 * L - q;
+	return float3(
+		HueToChannel(p, q, H + 1.0 / 3.0),
+		HueToChannel(p, q, H),
+		HueToChannel(p, q, H - 1.0 / 3.0));
+}
+
+float HueRangeWeight(float hue, float center, float halfWidth, float feather)
+{
+	float dist = abs(hue - center);
+	dist = min(dist, 1.0 - dist);
+	float sharpWidth  = halfWidth * 0.3;
+	float smoothWidth = halfWidth * 2.5;
+	float activeWidth  = lerp(sharpWidth, smoothWidth, feather);
+	return smoothstep(activeWidth, activeWidth * 0.15, dist);
+}
+
+float3 ApplyHSL(float3 color,
+				float4 hueShift1, float4 hueShift2,
+				float4 satAdj1,   float4 satAdj2,
+				float4 lumAdj1,   float4 lumAdj2,
+				float smoothing)
+{
+	float peak = max(max(color.r, color.g), color.b);
+	float restoreScale = max(peak, 0.0001);
+	float3 normColor = (peak > 1.0) ? color / peak : color;
+	float3 hsl = RGBToHSL(normColor);
+	if (hsl.y < 0.01)
+		return color;
+	float feather = saturate(smoothing * 0.01);
+
+	float w0 = HueRangeWeight(hsl.x, 0.000, 0.069, feather);
+	float w1 = HueRangeWeight(hsl.x, 0.083, 0.069, feather);
+	float w2 = HueRangeWeight(hsl.x, 0.167, 0.069, feather);
+	float w3 = HueRangeWeight(hsl.x, 0.333, 0.100, feather);
+	float w4 = HueRangeWeight(hsl.x, 0.500, 0.083, feather);
+	float w5 = HueRangeWeight(hsl.x, 0.667, 0.083, feather);
+	float w6 = HueRangeWeight(hsl.x, 0.792, 0.069, feather);
+	float w7 = HueRangeWeight(hsl.x, 0.917, 0.069, feather);
+
+	float wTotal = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
+	float invW   = (wTotal > 0.001) ? 1.0 / wTotal : 0.0;
+
+	float hueAdj = (w0 * hueShift1.x + w1 * hueShift1.y + w2 * hueShift1.z + w3 * hueShift1.w
+				  + w4 * hueShift2.x + w5 * hueShift2.y + w6 * hueShift2.z + w7 * hueShift2.w) * invW;
+	float satMod = (w0 * satAdj1.x + w1 * satAdj1.y + w2 * satAdj1.z + w3 * satAdj1.w
+				  + w4 * satAdj2.x + w5 * satAdj2.y + w6 * satAdj2.z + w7 * satAdj2.w) * invW;
+	float lumMod = (w0 * lumAdj1.x + w1 * lumAdj1.y + w2 * lumAdj1.z + w3 * lumAdj1.w
+				  + w4 * lumAdj2.x + w5 * lumAdj2.y + w6 * lumAdj2.z + w7 * lumAdj2.w) * invW;
+
+	hsl.x = frac(hsl.x + hueAdj * 0.002);
+	hsl.y = saturate(hsl.y * (1.0 + satMod * 0.01));
+	hsl.z = saturate(hsl.z * (1.0 + lumMod * 0.01));
+
+	float3 result = HSLToRGB(hsl);
+	return result * ((peak > 1.0) ? peak : 1.0);
+}
+
+float3 ApplyVibrance(float3 color, float vibrance)
+{
+	if (abs(vibrance) < 0.01)
+		return color;
+	float v    = vibrance * 0.01;
+	float luma = Luma(color);
+	float maxC = max(color.r, max(color.g, color.b));
+	float minC = min(color.r, min(color.g, color.b));
+	float sat  = (maxC > 0.0001) ? (maxC - minC) / maxC : 0.0;
+	float boostFactor = v * (1.0 - sat);
+	float3 normC = color / max(maxC, 0.0001);
+	float isSkinTone = smoothstep(0.1, 0.3, normC.r - normC.b) *
+					   smoothstep(0.0, 0.15, normC.g - normC.b);
+	boostFactor *= lerp(1.0, 0.5, isSkinTone);
+	float finalSat = 1.0 + boostFactor;
+	return max(lerp(float3(luma, luma, luma), color, finalSat), 0.0);
+}
+
+float3 ApplySaturation(float3 color, float saturation)
+{
+	float s    = 1.0 + saturation * 0.01;
+	float luma = Luma(color);
+	return max(lerp(float3(luma, luma, luma), color, s), 0.0);
+}
+
+float ApplyParametricCurve(float x, float4 params)
+{
+	float h = params.x * 0.01;
+	float l = params.y * 0.01;
+	float d = params.z * 0.01;
+	float s = params.w * 0.01;
+	float t   = saturate(x);
+	float omt = 1.0 - t;
+	float B0 = omt * omt * omt;
+	float B1 = 3.0 * t * omt * omt;
+	float B2 = 3.0 * t * t * omt;
+	float B3 = t * t * t;
+	float adjustment = s * B0 + d * B1 + l * B2 + h * B3;
+	return saturate(t + adjustment * 0.5);
+}
+
+float3 ApplyToneCurve(float3 color, float4 params)
+{
+	color.r = ApplyParametricCurve(color.r, params);
+	color.g = ApplyParametricCurve(color.g, params);
+	color.b = ApplyParametricCurve(color.b, params);
+	return color;
+}
+
+// --- Film Curves ---
+float3 HableFilmCurveRaw(float3 x, float A, float B, float C, float D, float E, float F)
+{
+	return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+}
+
+float3 HableFilmCurve(float3 color, float4 params1, float4 params2)
+{
+	float A = params1.x, B = params1.y, C = params1.z, D = params1.w;
+	float E = params2.x, F = params2.y, W = params2.z;
+	float3 numerator   = HableFilmCurveRaw(color, A, B, C, D, E, F);
+	float3 denominator = HableFilmCurveRaw(float3(W, W, W), A, B, C, D, E, F);
+	return numerator / max(denominator, 0.0001);
+}
+
+float3 ReinhardStandard(float3 color, float Lw)
+{
+	float Lw2 = Lw * Lw;
+	return color * (1.0 + color / Lw2) / (1.0 + color);
+}
+
+float3 ReinhardLuminance(float3 color, float Lw)
+{
+	float l = Luma(color);
+	float Lw2 = Lw * Lw;
+	float lNew = l * (1.0 + l / Lw2) / (1.0 + l);
+	return color * (lNew / max(l, 0.0001));
+}
+
+float3 ReinhardJodie(float3 color, float Lw)
+{
+	float l = Luma(color);
+	float Lw2 = Lw * Lw;
+	float3 tv = color * (1.0 + color / Lw2) / (1.0 + color);
+	float lMapped = l * (1.0 + l / Lw2) / (1.0 + l);
+	float3 lumPreserved = color * (lMapped / max(l, 0.0001));
+	return lerp(lumPreserved, tv, tv);
+}
+
+// --- AgX ---
+static const float3x3 AgXInsetMatrix = float3x3(
+	0.842479062253094,  0.0423738568574042, 0.0423738568574042,
+	0.0784335999999992, 0.878468636469772,  0.0784335999999992,
+	0.0792237451477643, 0.0791661274605434, 0.879142973793104
+);
+
+static const float3x3 AgXOutsetMatrix = float3x3(
+	 1.19687900512017,   -0.0528968517574562, -0.0529716355144438,
+	-0.0980208811401368,  1.15190312990417,   -0.0980434066710036,
+	-0.0990297440797205, -0.0989611768448433,  1.15107367264116
+);
+
+float3 AgXDefaultContrastApprox(float3 x)
+{
+	float3 x2 = x * x;
+	float3 x4 = x2 * x2;
+	return + 15.5     * x4 * x2
+	       - 40.14    * x4 * x
+	       + 31.96    * x4
+	       - 6.868    * x2 * x
+	       + 0.4298   * x2
+	       + 0.1191   * x
+	       - 0.00232;
+}
+
+float3 AgXCore(float3 color, float minEV, float maxEV)
+{
+	color = mul(AgXInsetMatrix, color);
+	color = max(color, 1e-10);
+	color = log2(color);
+	color = (color - minEV) / (maxEV - minEV);
+	color = saturate(color);
+	color = AgXDefaultContrastApprox(color);
+	return color;
+}
+
+float3 AgXLookPunchy(float3 color)
+{
+	float3 luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+	color = luma + 1.35 * (color - luma);
+	color = pow(max(color, 0.0), 1.35);
+	return color;
+}
+
+float3 AgXLookGolden(float3 color)
+{
+	float3 luma = dot(color, float3(0.2126, 0.7152, 0.0722));
+	color = luma + 1.15 * (color - luma);
+	float3 goldTint = float3(1.06, 0.98, 0.89);
+	color *= lerp(goldTint, float3(1.0, 1.0, 1.0), saturate(luma));
+	color = pow(max(color, 0.0), 1.10);
+	return color;
+}
+
+float3 AgXToneMap(float3 color, float4 agxParams)
+{
+	float minEV = agxParams.x;
+	float maxEV = agxParams.y;
+	float look  = agxParams.z;
+	color = AgXCore(color, minEV, maxEV);
+	if (look > 0.5 && look < 1.5)
+		color = AgXLookPunchy(color);
+	else if (look > 1.5)
+		color = AgXLookGolden(color);
+	color = mul(AgXOutsetMatrix, color);
+	color = saturate(color);
+	return color;
+}
+
+float3 ApplyFilmCurve(float3 color, float mode, float4 hableParams1, float4 hableParams2, float reinhardWP)
+{
+	if (mode < 0.5)
+		return HableFilmCurve(color, hableParams1, hableParams2);
+	else if (mode < 1.5)
+		return ReinhardLuminance(color, reinhardWP);
+	else if (mode < 2.5)
+		return ReinhardJodie(color, reinhardWP);
+	else if (mode < 3.5)
+		return ReinhardStandard(color, reinhardWP);
+	else if (mode > 5.5)
+		return AgXToneMap(color, AgXParams);
+	else
+		return ReinhardStandard(color, reinhardWP);
+}
+
+float LinearToSRGBChannel(float val)
+{
+	if (val <= 0.0031308)
+		return val * 12.92;
+	else
+		return 1.055 * pow(val, 1.0 / 2.4) - 0.055;
+}
+
+float3 LinearToSRGB(float3 color)
+{
+	return float3(
+		LinearToSRGBChannel(color.r),
+		LinearToSRGBChannel(color.g),
+		LinearToSRGBChannel(color.b));
+}
+
+// ============================================================================
+// LUT Generation Entry Point
+// ============================================================================
+// Renders to a 2D unwrapped LUT texture (LUTSize*LUTSize × LUTSize).
+// For 32^3: 1024 × 32.
+// ============================================================================
+
+void CombineLUTPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	// Reconstruct 3D color coordinate from integer texel position.
+	// Layout: X axis holds LUTSize slices of LUTSize texels each (R within slice, B = slice index).
+	//         Y axis maps directly to G.
+	// Texel 0 → 0.0, texel (LUTSize-1) → 1.0 — full [0,1] range.
+	float2 texel = floor(SvPosition.xy);
+	float invRange = 1.0 / (LUTSize - 1.0);
+	float3 color;
+	color.r = fmod(texel.x, LUTSize) * invRange;
+	color.b = floor(texel.x / LUTSize) * invRange;
+	color.g = texel.y * invRange;
+
+	// color is now the neutral LUT coordinate in [0, 1]
+
+	if (bReplaceTonemap > 0.5)
+	{
+		// =========================================================
+		// ReplaceTonemap LUT: input is HDR scene-referred linear.
+		// We need to handle the unbounded input domain.
+		// The LUT encodes a log2 range: [2^MinLogEV, 2^MaxLogEV] → [0,1]
+		// At runtime, the apply shader log-encodes the input before lookup.
+		// =========================================================
+
+		// Decode from LUT [0,1] to HDR linear using log2 range.
+		// 16.5-stop range covering deep shadows to bright highlights.
+		float MinLogEV = -10.0;
+		float MaxLogEV = 6.5;
+		float3 logColor = lerp(MinLogEV, MaxLogEV, color);
+		color = exp2(logColor);
+
+		// Now 'color' is in HDR linear space — apply the same chain
+		// as ToneMapProcess (minus spatial ops)
+
+		// White Balance
+		color = ApplyWhiteBalance(color, Temperature, Tint);
+
+		// Exposure
+		float ev = ExposureValue;
+		if (bUseCameraExposure > 0.5)
+			ev += CameraEV;
+		if (abs(ev) > 0.001)
+			color = ApplyExposure(color, ev);
+
+		// Tone Adjustments
+		color = ApplyToneAdjustments(color, HighlightsValue, ShadowsValue,
+									 WhitesValue, BlacksValue, ToneSmoothingValue);
+
+		// Contrast
+		color = ApplyContrast(color, Contrast, ContrastMidpoint);
+
+		// HSL
+		if (bEnableHSL > 0.5)
+		{
+			color = ApplyHSL(color, HueShift1, HueShift2,
+							 SatAdj1, SatAdj2, LumAdj1, LumAdj2, HSLSmoothing);
+		}
+
+		// Vibrance
+		color = ApplyVibrance(color, VibranceStrength);
+
+		// Saturation
+		color = ApplySaturation(color, SaturationStrength);
+
+		// HDR Saturation
+		{
+			float luma = Luma(color);
+			color = lerp(float3(luma, luma, luma), color, HDRSaturation);
+		}
+
+		// HDR Color Balance
+		color *= HDRColorBalance;
+
+		color = max(color, 0.0);
+
+		// Film Curve (skip for Durand/Fattal which are pre-tone-mapped)
+		if (bPreToneMapped < 0.5)
+		{
+			color = ApplyFilmCurve(color, FilmCurveMode, HableParams1, HableParams2, ReinhardWhitePoint);
+		}
+
+		// Parametric Tone Curve
+		if (bEnableCurves > 0.5)
+		{
+			color = ApplyToneCurve(color, ToneCurveParams);
+		}
+
+		// sRGB
+		color = saturate(color);
+		color = LinearToSRGB(color);
+	}
+	else
+	{
+		// =========================================================
+		// PostProcess LUT: input is LDR [0,1] (already tonemapped)
+		// The LUT coordinate IS the input color directly.
+		// =========================================================
+
+		// White Balance
+		color = ApplyWhiteBalance(color, Temperature, Tint);
+
+		// Exposure
+		float ev = ExposureValue;
+		if (bUseCameraExposure > 0.5)
+			ev += CameraEV;
+		if (abs(ev) > 0.001)
+			color = ApplyExposure(color, ev);
+
+		// Tone Adjustments
+		color = ApplyToneAdjustments(color, HighlightsValue, ShadowsValue,
+									 WhitesValue, BlacksValue, ToneSmoothingValue);
+
+		// Contrast
+		color = ApplyContrast(color, Contrast, ContrastMidpoint);
+
+		// HSL
+		if (bEnableHSL > 0.5)
+		{
+			color = ApplyHSL(color, HueShift1, HueShift2,
+							 SatAdj1, SatAdj2, LumAdj1, LumAdj2, HSLSmoothing);
+		}
+
+		// Vibrance
+		color = ApplyVibrance(color, VibranceStrength);
+
+		// Saturation
+		color = ApplySaturation(color, SaturationStrength);
+
+		// Parametric Tone Curve
+		if (bEnableCurves > 0.5)
+		{
+			color = ApplyToneCurve(color, ToneCurveParams);
+		}
+
+		color = max(color, 0.0);
+	}
+
+	color = saturate(color);
+	OutColor = float4(color, 1.0);
+}
