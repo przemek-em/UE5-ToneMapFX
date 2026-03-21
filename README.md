@@ -199,6 +199,7 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - [x] ~~LUT Processing Path~~ *(done — 32³ baked LUT mode, dual-path Per-Pixel/LUT, CombineLUT+ApplyLUT shaders)*
 - [x] ~~FP16 Pipeline Override~~ *(done — Force FP16 Pipeline checkbox, r.PostProcessing.PropagateAlpha toggle, eliminates 10-bit/11-bit quantization)*
 - [x] ~~Dither Quantization Control~~ *(done — user-adjustable noise quantum slider, default 1/255)*
+- [ ] Fix UE 5.7 SMAA not working properly with plugin pipeline
 - [ ] LUT export
 - [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves
