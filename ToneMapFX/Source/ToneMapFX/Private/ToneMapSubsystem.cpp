@@ -67,6 +67,8 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 			// Auto-toggle r.PostProcessing.PropagateAlpha to force FP16 precision
 			// through the entire post-process chain (TAA/TSR, tonemapper output).
 			// Prevents 10-bit/11-bit quantization banding at source.
+			// Compatible with SMAA — the CVar is set once per frame on the game
+			// thread, so the FAlphaChannelDim shader permutation is stable.
 			{
 				static IConsoleVariable* CVarPropAlpha = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PostProcessing.PropagateAlpha"));
 				if (CVarPropAlpha)
@@ -232,6 +234,12 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	FScreenPassTexture SceneColor = FScreenPassTexture::CopyFromSlice(
 		GraphBuilder, Inputs.GetInput(EPostProcessMaterialInput::SceneColor));
 	if (!SceneColor.IsValid()) return SceneColor;
+
+	// Save original SceneColor extent before bloom/lens processing modifies it.
+	// The engine allocates scene buffers with QuantizeSceneBufferSize, rounding
+	// up to multiples of 8. SMAA computes RTMetrics from the texture extent
+	// and expects this quantized value; un-quantized extents cause UV mismatch.
+	const FIntPoint OriginalSceneColorExtent = SceneColor.Texture->Desc.Extent;
 
 	const FViewInfo& ViewInfo = static_cast<const FViewInfo&>(View);
 	if (ViewInfo.bIsReflectionCapture || ViewInfo.bIsSceneCapture || !ViewInfo.bIsViewInfo)
@@ -1380,22 +1388,30 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	// =====================================================================
 
 	FScreenPassRenderTarget OutputTarget;
+
 	if (bIsReplaceTonemap && Inputs.OverrideOutput.IsValid())
 	{
 		// ReplacingTonemapper: engine provides the final backbuffer as OverrideOutput
+		// when Tonemap is the last pass (no FXAA/SMAA after). Use it directly.
 		OutputTarget = Inputs.OverrideOutput;
 	}
 	else
 	{
+		// Create an intermediate FP16 texture for downstream passes (SMAA, FXAA).
+		// Extent must match the engine's quantized scene buffer extent so that
+		// SMAA's QuantizeSceneBufferSize(Extent) is a no-op and RTMetrics are
+		// correct.  ViewRect stays (0,0)-based matching ViewportSize.
+		// EClear prevents uninitialized gap pixels between ViewRect and extent
+		// from showing as green in non-fullscreen viewports.
 		OutputTarget = FScreenPassRenderTarget(
 			GraphBuilder.CreateTexture(
 				FRDGTextureDesc::Create2D(
-					ViewportSize, SceneColor.Texture->Desc.Format,
-					FClearValueBinding::None,
+					OriginalSceneColorExtent, PF_FloatRGBA,
+					FClearValueBinding::Black,
 					TexCreate_ShaderResource | TexCreate_RenderTargetable),
 				TEXT("ToneMap.Output")),
 			FIntRect(0, 0, ViewportSize.X, ViewportSize.Y),
-			ERenderTargetLoadAction::ENoAction);
+			ERenderTargetLoadAction::EClear);
 	}
 
 	// =====================================================================
