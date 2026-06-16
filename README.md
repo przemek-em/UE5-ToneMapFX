@@ -248,9 +248,6 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - **[Stephen Hill / MJP - BakingLab ACES.hlsl](https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl)** - ACES fitted curve with input/output color transforms.
 - **[Krzysztof Narkowicz - ACES Filmic Tone Mapping Curve](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)** - Compact ACES filmic approximation used for the ACES Narkowicz fit.
 
-### Sharpening
-- **[AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS)** - Contrast Adaptive Sharpening reference implementation used as the basis for the AMD CAS sharpening option.
-
 ### Hable (Uncharted 2) Filmic Curve
 John Hable's filmic tonemapping curve, originally developed for *Uncharted 2*, uses a parametric function with 6 constants (Shoulder Strength, Linear Strength, Linear Angle, Toe Strength, Toe Numerator, Toe Denominator) plus a White Point. It produces a natural-looking film response with controllable shoulder rolloff, a linear middle region, and a lifted toe - closely matching how real film stock responds to light.
 
@@ -298,3 +295,6 @@ Based on Troy Sobotka's open-source AgX display rendering pipeline. Scene-linear
 
 - **[Troy Sobotka — AgX (GitHub)](https://github.com/sobotka/AgX)**
 - **[AgX / Troy Sobotka — Blender Documentation](https://docs.blender.org/manual/en/latest/render/color_management/color_spaces.html)**
+
+## Sharpening
+- **[AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS)** - Contrast Adaptive Sharpening reference implementation used as the basis for the AMD CAS sharpening option.
