@@ -19,6 +19,7 @@ FScreenTransform SvPositionToSceneColorUV;
 // w = FalloffMode (0=Linear, 1=Smooth, 2=Soft, 3=Hard, 4=Custom)
 float4 VignetteParams;
 float  FalloffExponent;  // power curve exponent (Custom mode)
+float  bLinearHDROutput;
 
 // ── Falloff curve helper ────────────────────────────────────────────
 // Takes a 0→1 linear ramp t and reshapes it.
@@ -103,7 +104,9 @@ void VignettePS(
 		else
 		{
 			// texAlpha 1 → no change, texAlpha 0 → lighten toward white
-			float3 result = lerp(scene, lerp(scene, 1.0, 1.0 - texAlpha), absIntensity);
+			float3 result = (bLinearHDROutput > 0.5)
+				? scene + (1.0 - texAlpha) * absIntensity
+				: lerp(scene, lerp(scene, 1.0, 1.0 - texAlpha), absIntensity);
 			OutColor = float4(result, 1.0);
 		}
 		return;
@@ -150,7 +153,9 @@ void VignettePS(
 		}
 		else
 		{
-			sqResult = scene + sqMask * (1.0 - scene) + dither;
+			sqResult = (bLinearHDROutput > 0.5)
+				? scene + sqMask + dither
+				: scene + sqMask * (1.0 - scene) + dither;
 		}
 
 		OutColor = float4(sqResult, 1.0);
@@ -179,7 +184,9 @@ void VignettePS(
 	else
 	{
 		// Lighten edges (screen blend)
-		result = scene + mask * (1.0 - scene) + dither;
+		result = (bLinearHDROutput > 0.5)
+			? scene + mask + dither
+			: scene + mask * (1.0 - scene) + dither;
 	}
 
 	OutColor = float4(result, 1.0);

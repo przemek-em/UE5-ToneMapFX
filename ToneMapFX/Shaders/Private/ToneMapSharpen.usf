@@ -5,7 +5,9 @@
 #include "/Engine/Private/ScreenPass.ush"
 
 // ============================================================================
-// Unsharp Mask Sharpening
+// Unsharp Mask / AMD CAS Sharpening
+// CAS branch is based on AMD FidelityFX Contrast Adaptive Sharpening.
+// See ThirdPartyNotices/FidelityFX-CAS.txt.
 //
 // 9-tap kernel: 4 cardinal + 4 diagonal neighbors weighted to approximate
 // a small Gaussian blur, then subtracts from original to extract detail.
@@ -18,7 +20,10 @@ FScreenTransform SvPositionToSceneColorUV;
 
 float SharpenAmount;   // 0 .. 100
 float SharpenRadius;   // 0.5 .. 5.0 pixels
+float SharpenMethod;   // 0 = legacy unsharp mask, 1 = AMD CAS
+float CASInputRange;   // SDR = 1, True HDR = display max nits / paper white nits
 float2 TexelSize;      // 1/width, 1/height
+float bLinearHDROutput;
 float DitherQuantization; // 0 = off, 1/255 = 8-bit, 1/1023 = 10-bit
 
 // Interleaved gradient noise (Jimenez 2014)
@@ -28,9 +33,18 @@ float IGNoise(float2 screenPos)
 	return frac(magic.z * frac(dot(screenPos, magic.xy)));
 }
 
-void SharpenPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+float3 ClampSharpenOutput(float3 color)
 {
-	float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	if (bLinearHDROutput > 0.5)
+	{
+		return clamp(color, 0.0, max(CASInputRange, 1.0));
+	}
+
+	return saturate(color);
+}
+
+float3 ApplyLegacySharpen(float2 UV)
+{
 	float3 center = Texture2DSample(SceneColorTexture, SceneColorSampler, UV).rgb;
 
 	float2 offset = TexelSize * SharpenRadius;
@@ -54,7 +68,53 @@ void SharpenPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0
 	// Unsharp mask: extract detail and add back
 	float3 detail = center - blurred;
 	float3 sharpened = center + detail * (SharpenAmount * 0.01);
-	sharpened = saturate(sharpened);
+
+	return ClampSharpenOutput(sharpened);
+}
+
+float3 ApplyCASSharpen(float2 UV)
+{
+	float2 offset = TexelSize;
+
+	float3 b = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(0.0, -offset.y)).rgb;
+	float3 d = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(-offset.x, 0.0)).rgb;
+	float3 e = Texture2DSample(SceneColorTexture, SceneColorSampler, UV).rgb;
+	float3 f = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(offset.x, 0.0)).rgb;
+	float3 h = Texture2DSample(SceneColorTexture, SceneColorSampler, UV + float2(0.0, offset.y)).rgb;
+
+	float signalLimit = max(CASInputRange, 1.0);
+	b = clamp(b, 0.0, signalLimit);
+	d = clamp(d, 0.0, signalLimit);
+	e = clamp(e, 0.0, signalLimit);
+	f = clamp(f, 0.0, signalLimit);
+	h = clamp(h, 0.0, signalLimit);
+
+	float3 mn = min(min(min(d, e), f), min(b, h));
+	float3 mx = max(max(max(d, e), f), max(b, h));
+
+	float3 amp = saturate(min(mn, signalLimit - mx) / max(mx, 1e-5));
+	amp = sqrt(amp);
+
+	float sharpness = saturate(SharpenAmount * 0.01);
+	float peak = -rcp(lerp(8.0, 5.0, sharpness));
+	float3 w = amp * peak;
+
+	float3 sharpened = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
+	return ClampSharpenOutput(sharpened);
+}
+
+void SharpenPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	float2 UV = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 sharpened = 0.0;
+	if (SharpenMethod > 0.5)
+	{
+		sharpened = ApplyCASSharpen(UV);
+	}
+	else
+	{
+		sharpened = ApplyLegacySharpen(UV);
+	}
 
 	// Dithering (last-pass only; quantum set by subsystem)
 	if (DitherQuantization > 0.0)
@@ -64,5 +124,6 @@ void SharpenPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0
 		sharpened += (n1 + n2 - 1.0) * DitherQuantization;
 	}
 
+	sharpened = ClampSharpenOutput(sharpened);
 	OutColor = float4(sharpened, 1.0);
 }

@@ -27,12 +27,16 @@ public:
 
 		// Mode: 0 = PostProcess (LDR), 1 = ReplaceTonemap (HDR)
 		SHADER_PARAMETER(float, bReplaceTonemap)
+		SHADER_PARAMETER(float, bLinearHDROutput)
 
 		// Film Curve params (ReplaceTonemap mode)
 		SHADER_PARAMETER(float, FilmCurveMode)
 		SHADER_PARAMETER(FVector4f, HableParams1)
 		SHADER_PARAMETER(FVector4f, HableParams2)
 		SHADER_PARAMETER(float, ReinhardWhitePoint)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CustomCurveTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, CustomCurveSampler)
+		SHADER_PARAMETER(FVector4f, CustomCurveParams)
 		SHADER_PARAMETER(float, HDRSaturation)
 		SHADER_PARAMETER(FVector3f, HDRColorBalance)
 		SHADER_PARAMETER(FVector4f, AgXParams)
@@ -71,6 +75,7 @@ public:
 		SHADER_PARAMETER(FVector4f, LumAdj1)
 		SHADER_PARAMETER(FVector4f, LumAdj2)
 		SHADER_PARAMETER(float, HSLSmoothing)
+		SHADER_PARAMETER(float, HSLMode) // 0=Smooth, 1=Legacy
 
 		// Feature toggles
 		SHADER_PARAMETER(float, bEnableHSL)
@@ -112,6 +117,7 @@ public:
 
 		// Mode: 0 = PostProcess (LDR), 1 = ReplaceTonemap (HDR)
 		SHADER_PARAMETER(float, bReplaceTonemap)
+		SHADER_PARAMETER(float, bLinearHDROutput)
 
 		// Bloom (ReplaceTonemap mode)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, BloomTexture)

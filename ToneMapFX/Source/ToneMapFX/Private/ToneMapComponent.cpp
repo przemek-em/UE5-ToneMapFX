@@ -2,9 +2,15 @@
 
 #include "ToneMapComponent.h"
 #include "ToneMapSubsystem.h"
+#include "Curves/CurveFloat.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "PrimitiveSceneProxy.h"
+#include "PrimitiveViewRelevance.h"
+#include "SceneManagement.h"
+#include "SceneView.h"
 #include "UObject/UnrealType.h"
 #include "UObject/TextProperty.h"
 #include "UObject/EnumProperty.h"
@@ -18,6 +24,137 @@ UToneMapComponent::UToneMapComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
 	bAutoActivate = true;
+	bUseEditorCompositing = true;
+}
+
+void UToneMapComponent::PostLoad()
+{
+	Super::PostLoad();
+
+	if (!bUseSceneColor && BloomColorMode == EBloomColorMode::SceneColor)
+	{
+		BloomColorMode = EBloomColorMode::Tint;
+	}
+
+	RebuildCustomToneCurveTexture();
+}
+
+namespace
+{
+FVector GetNonNegativeBlendExtent(const FVector& InExtent)
+{
+	return FVector(
+		FMath::Max(InExtent.X, 0.0f),
+		FMath::Max(InExtent.Y, 0.0f),
+		FMath::Max(InExtent.Z, 0.0f));
+}
+
+class FToneMapBlendBoundsSceneProxy final : public FPrimitiveSceneProxy
+{
+public:
+	FToneMapBlendBoundsSceneProxy(const UToneMapComponent* InComponent)
+		: FPrimitiveSceneProxy(InComponent)
+		, InnerExtent(GetNonNegativeBlendExtent(InComponent->BlendBoxExtent))
+		, FalloffDistance(FMath::Max(InComponent->BlendFalloffDistance, 0.0f))
+		, LineThickness(FMath::Max(InComponent->BlendBoundsLineThickness, 0.0f))
+	{
+		bWillEverBeLit = false;
+	}
+
+	SIZE_T GetTypeHash() const override
+	{
+		static size_t UniquePointer;
+		return reinterpret_cast<size_t>(&UniquePointer);
+	}
+
+	void GetDynamicMeshElements(
+		const TArray<const FSceneView*>& Views,
+		const FSceneViewFamily& ViewFamily,
+		uint32 VisibilityMap,
+		FMeshElementCollector& Collector) const override
+	{
+		const FMatrix& LocalToWorldMatrix = GetLocalToWorld();
+		const FVector Origin = LocalToWorldMatrix.GetOrigin();
+		const FVector XAxis = LocalToWorldMatrix.GetScaledAxis(EAxis::X);
+		const FVector YAxis = LocalToWorldMatrix.GetScaledAxis(EAxis::Y);
+		const FVector ZAxis = LocalToWorldMatrix.GetScaledAxis(EAxis::Z);
+
+		for (int32 ViewIndex = 0; ViewIndex < Views.Num(); ++ViewIndex)
+		{
+			if ((VisibilityMap & (1 << ViewIndex)) == 0)
+			{
+				continue;
+			}
+
+			FPrimitiveDrawInterface* PDI = Collector.GetPDI(ViewIndex);
+			const FSceneView* View = Views[ViewIndex];
+			const FLinearColor BoxColor = GetViewSelectionColor(
+				FLinearColor(0.0f, 0.85f, 1.0f),
+				*View,
+				IsSelected(),
+				IsHovered(),
+				false,
+				IsIndividuallySelected());
+
+			DrawOrientedWireBox(PDI, Origin, XAxis, YAxis, ZAxis, InnerExtent, BoxColor, SDPG_World, LineThickness);
+
+			if (FalloffDistance > KINDA_SMALL_NUMBER)
+			{
+				const FVector FalloffExtent = InnerExtent + FVector(FalloffDistance);
+				DrawOrientedWireBox(PDI, Origin, XAxis, YAxis, ZAxis, FalloffExtent, FLinearColor(0.0f, 0.45f, 1.0f, 0.45f), SDPG_World, LineThickness);
+			}
+		}
+	}
+
+	FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override
+	{
+		FPrimitiveViewRelevance Result;
+		Result.bDrawRelevance = IsShown(View);
+		Result.bDynamicRelevance = true;
+		Result.bShadowRelevance = false;
+		Result.bEditorPrimitiveRelevance = UseEditorCompositing(View);
+		return Result;
+	}
+
+	uint32 GetMemoryFootprint() const override
+	{
+		return sizeof(*this) + GetAllocatedSize();
+	}
+
+	uint32 GetAllocatedSize() const
+	{
+		return FPrimitiveSceneProxy::GetAllocatedSize();
+	}
+
+private:
+	const FVector InnerExtent;
+	const float FalloffDistance;
+	const float LineThickness;
+};
+} // namespace
+
+FPrimitiveSceneProxy* UToneMapComponent::CreateSceneProxy()
+{
+	const FVector Extent = GetNonNegativeBlendExtent(BlendBoxExtent);
+	if (!bShowBlendBounds || BlendMode != EToneMapBlendMode::BoundingBox || Extent.SizeSquared() <= KINDA_SMALL_NUMBER)
+	{
+		return nullptr;
+	}
+
+	return new FToneMapBlendBoundsSceneProxy(this);
+}
+
+FBoxSphereBounds UToneMapComponent::CalcBounds(const FTransform& LocalToWorld) const
+{
+	if (!bShowBlendBounds || BlendMode != EToneMapBlendMode::BoundingBox)
+	{
+		return Super::CalcBounds(LocalToWorld);
+	}
+
+	const FVector Extent = GetNonNegativeBlendExtent(BlendBoxExtent);
+	const float FalloffDistance = FMath::Max(BlendFalloffDistance, 0.0f);
+	const FVector BoundsExtent = Extent + FVector(FalloffDistance);
+	return FBoxSphereBounds(FBox(-BoundsExtent, BoundsExtent)).TransformBy(LocalToWorld);
 }
 
 // ---------------------------------------------------------------------------
@@ -27,11 +164,18 @@ UToneMapComponent::UToneMapComponent()
 void UToneMapComponent::OnRegister()
 {
 	Super::OnRegister();
+#if WITH_EDITOR
+	BindCustomToneCurveUpdate();
+#endif
+	RebuildCustomToneCurveTexture();
 	RegisterWithSubsystem();
 }
 
 void UToneMapComponent::OnUnregister()
 {
+#if WITH_EDITOR
+	UnbindCustomToneCurveUpdate();
+#endif
 	UnregisterFromSubsystem();
 	Super::OnUnregister();
 }
@@ -74,6 +218,106 @@ void UToneMapComponent::UnregisterFromSubsystem()
 	}
 }
 
+float UToneMapComponent::GetBlendWeightAtLocation(const FVector& ViewLocation) const
+{
+	const float ClampedWeight = FMath::Clamp(BlendWeight, 0.0f, 1.0f);
+	if (!bEnabled || ClampedWeight <= 0.0f)
+	{
+		return 0.0f;
+	}
+
+	if (BlendMode == EToneMapBlendMode::Global)
+	{
+		return ClampedWeight;
+	}
+
+	const FVector LocalPosition = GetComponentTransform().InverseTransformPosition(ViewLocation);
+	const FVector AbsLocal(FMath::Abs(LocalPosition.X), FMath::Abs(LocalPosition.Y), FMath::Abs(LocalPosition.Z));
+	const FVector Extent(
+		FMath::Max(BlendBoxExtent.X, 0.0f),
+		FMath::Max(BlendBoxExtent.Y, 0.0f),
+		FMath::Max(BlendBoxExtent.Z, 0.0f));
+	const FVector Outside(
+		FMath::Max(AbsLocal.X - Extent.X, 0.0f),
+		FMath::Max(AbsLocal.Y - Extent.Y, 0.0f),
+		FMath::Max(AbsLocal.Z - Extent.Z, 0.0f));
+
+	const float OutsideDistance = Outside.Size();
+	if (OutsideDistance <= KINDA_SMALL_NUMBER)
+	{
+		return ClampedWeight;
+	}
+
+	const float FalloffDistance = FMath::Max(BlendFalloffDistance, 0.0f);
+	if (FalloffDistance <= KINDA_SMALL_NUMBER || OutsideDistance >= FalloffDistance)
+	{
+		return 0.0f;
+	}
+
+	const float LinearAlpha = 1.0f - (OutsideDistance / FalloffDistance);
+	const float SmoothAlpha = LinearAlpha * LinearAlpha * (3.0f - 2.0f * LinearAlpha);
+	return ClampedWeight * SmoothAlpha;
+}
+
+void UToneMapComponent::RebuildCustomToneCurveTexture()
+{
+	if (HasAnyFlags(RF_ClassDefaultObject))
+	{
+		CustomToneCurveTexture = nullptr;
+		return;
+	}
+
+	const int32 SampleCount = FMath::Clamp(CustomCurveSampleCount, 64, 4096);
+	const float MinEV = FMath::Clamp(CustomCurveMinEV, -24.0f, 23.99f);
+	const float MaxEV = FMath::Clamp(FMath::Max(CustomCurveMaxEV, MinEV + 0.01f), MinEV + 0.01f, 24.0f);
+	const float EVRange = FMath::Max(MaxEV - MinEV, 0.01f);
+
+	CustomCurveSampleCount = SampleCount;
+	CustomCurveMinEV = MinEV;
+	CustomCurveMaxEV = MaxEV;
+
+	TArray<uint8> TextureBytes;
+	TextureBytes.SetNumUninitialized(SampleCount * sizeof(float));
+
+	float* Samples = reinterpret_cast<float*>(TextureBytes.GetData());
+	for (int32 Index = 0; Index < SampleCount; ++Index)
+	{
+		const float U = (SampleCount > 1) ? ((float)Index / (float)(SampleCount - 1)) : 0.0f;
+		const float EV = MinEV + EVRange * U;
+		const float SceneLuminance = FMath::Max(FMath::Pow(2.0f, EV), 0.0f);
+		float MappedLuminance = CustomToneCurve ? CustomToneCurve->GetFloatValue(U) : (SceneLuminance / (1.0f + SceneLuminance));
+
+		if (!FMath::IsFinite(MappedLuminance))
+		{
+			MappedLuminance = 0.0f;
+		}
+
+		Samples[Index] = FMath::Max(MappedLuminance, 0.0f);
+	}
+
+	CustomToneCurveTexture = UTexture2D::CreateTransient(
+		SampleCount,
+		1,
+		PF_R32_FLOAT,
+		NAME_None,
+		TConstArrayView64<uint8>(TextureBytes.GetData(), TextureBytes.Num()));
+
+	if (CustomToneCurveTexture)
+	{
+		CustomToneCurveTexture->NeverStream = true;
+		CustomToneCurveTexture->SRGB = false;
+		CustomToneCurveTexture->Filter = TF_Bilinear;
+		CustomToneCurveTexture->AddressX = TA_Clamp;
+		CustomToneCurveTexture->AddressY = TA_Clamp;
+		CustomToneCurveTexture->UpdateResource();
+	}
+
+	if (IsRegistered())
+	{
+		MarkRenderStateDirty();
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -90,6 +334,7 @@ static const TSet<FString> GPresetSkipProperties = {
 	TEXT("AssetUserData"),
 	TEXT("bReplicates"),
 	TEXT("bNetAddressable"),
+	TEXT("CustomToneCurveTexture"),
 };
 
 FString UToneMapComponent::GetPresetDirectory()
@@ -245,6 +490,12 @@ bool UToneMapComponent::LoadPresetFromPath(const FString& FilePath)
 		Key.TrimStartAndEndInline();
 		Value.TrimStartAndEndInline();
 
+		if (GPresetSkipProperties.Contains(Key))
+		{
+			Skipped++;
+			continue;
+		}
+
 		FProperty** FoundProp = PropMap.Find(Key);
 		if (!FoundProp || !(*FoundProp))
 		{
@@ -271,6 +522,8 @@ bool UToneMapComponent::LoadPresetFromPath(const FString& FilePath)
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("ToneMapFX: Preset loaded ← %s (%d applied, %d skipped)"), *FilePath, Applied, Skipped);
+
+	RebuildCustomToneCurveTexture();
 
 #if WITH_EDITOR
 	// Notify the editor that all properties changed so the Details panel
@@ -310,6 +563,47 @@ bool UToneMapComponent::IsAnyCurveActive() const
 		FMath::Abs(CurveDarks) > Eps || FMath::Abs(CurveShadows) > Eps;
 }
 
+#if WITH_EDITOR
+void UToneMapComponent::BindCustomToneCurveUpdate()
+{
+	UCurveFloat* CurrentCurve = CustomToneCurve.Get();
+	if (BoundCustomToneCurve.Get() == CurrentCurve && CustomToneCurveUpdateHandle.IsValid())
+	{
+		return;
+	}
+
+	UnbindCustomToneCurveUpdate();
+
+	if (CurrentCurve)
+	{
+		CustomToneCurveUpdateHandle = CurrentCurve->OnUpdateCurve.AddUObject(this, &UToneMapComponent::HandleCustomToneCurveUpdated);
+		BoundCustomToneCurve = CurrentCurve;
+	}
+}
+
+void UToneMapComponent::UnbindCustomToneCurveUpdate()
+{
+	if (UCurveFloat* PreviousCurve = BoundCustomToneCurve.Get())
+	{
+		if (CustomToneCurveUpdateHandle.IsValid())
+		{
+			PreviousCurve->OnUpdateCurve.Remove(CustomToneCurveUpdateHandle);
+		}
+	}
+
+	CustomToneCurveUpdateHandle.Reset();
+	BoundCustomToneCurve.Reset();
+}
+
+void UToneMapComponent::HandleCustomToneCurveUpdated(UCurveBase* Curve, EPropertyChangeType::Type ChangeType)
+{
+	if (Curve == CustomToneCurve.Get())
+	{
+		RebuildCustomToneCurveTexture();
+	}
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Editor helpers
 // ---------------------------------------------------------------------------
@@ -319,13 +613,42 @@ void UToneMapComponent::PostEditChangeProperty(FPropertyChangedEvent& PropertyCh
 {
 	Super::PostEditChangeProperty(PropertyChangedEvent);
 
-	// When switching to Soft Focus mode, auto-select Soft Light blend mode
-	if (PropertyChangedEvent.GetPropertyName() == GET_MEMBER_NAME_CHECKED(UToneMapComponent, BloomMode))
+	const FName PropertyName = PropertyChangedEvent.GetPropertyName();
+	const bool bAnyPropertyChanged = PropertyName.IsNone();
+
+	// When switching to a soft focus mode, auto-select the matching blend mode.
+	if (bAnyPropertyChanged || PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, BloomMode))
 	{
 		if (BloomMode == EBloomMode::SoftFocus)
 		{
 			BloomBlendMode = EBloomBlendMode::SoftLight;
 		}
+		else if (BloomMode == EBloomMode::SoftFocusGlow)
+		{
+			BloomBlendMode = EBloomBlendMode::SoftLightGlow;
+		}
+	}
+
+	if (bAnyPropertyChanged ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, CustomToneCurve) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, CustomCurveMinEV) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, CustomCurveMaxEV) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, CustomCurveSampleCount) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, FilmCurve))
+	{
+		BindCustomToneCurveUpdate();
+		RebuildCustomToneCurveTexture();
+	}
+
+	if (bAnyPropertyChanged ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, BlendMode) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, BlendBoxExtent) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, BlendFalloffDistance) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, bShowBlendBounds) ||
+		PropertyName == GET_MEMBER_NAME_CHECKED(UToneMapComponent, BlendBoundsLineThickness))
+	{
+		UpdateBounds();
+		MarkRenderStateDirty();
 	}
 }
 #endif

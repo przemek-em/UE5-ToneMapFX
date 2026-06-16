@@ -10,8 +10,9 @@
 // =============================================================================
 // HDR Output Encoding — Final Pass
 //
-// Converts sRGB-encoded output from ToneMapProcess (and optional LUT / Vignette)
-// to the display's native HDR format: ST2084/PQ for HDR10, scRGB for Windows HDR.
+// Converts ToneMapFX output to the display's native HDR format: ST2084/PQ for
+// HDR10, scRGB for Windows HDR. Input can be the legacy sRGB paper-white result
+// or linear display-referred HDR when True HDR Output is selected.
 //
 // This pass runs only in ReplaceTonemap mode when HDR Output is enabled AND the
 // engine detects an HDR display (OutputDevice >= 3).
@@ -30,6 +31,7 @@ public:
 
 		// HDR encoding parameters
 		SHADER_PARAMETER(float, OutputDeviceType)  // EDisplayOutputFormat cast to float
+		SHADER_PARAMETER(float, bInputIsLinearHDR) // 0=sRGB paper-white mode, 1=linear HDR mode
 		SHADER_PARAMETER(float, PaperWhiteNits)    // User paper-white brightness (cd/m²)
 		SHADER_PARAMETER(float, MaxDisplayNits)    // Peak display luminance (cd/m²)
 		SHADER_PARAMETER(float, DitherQuantization) // 0=off, 1/255=8-bit, 1/1023=10-bit

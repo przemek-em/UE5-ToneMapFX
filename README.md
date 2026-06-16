@@ -4,7 +4,7 @@
 
 # Tone Map FX
 
-A post-process plugin for Unreal Engine 5.6 that brings **Photo RAW style color grading** directly into the engine viewport. Run it on top of UE's built-in tonemapper, or **fully replace** ACES with classic film curves (Hable, Reinhard, Durand, Fattal, AgX).
+A post-process plugin for Unreal Engine 5.6.1+ that brings **Photo RAW style color grading** directly into the engine viewport. Run it on top of UE's built-in tonemapper, or **fully replace** ACES with classic film curves (Hable, Reinhard, Durand, Fattal, AgX, ACES fits, and custom luminance curves).
 ![Image](Screens/HighresScreenshot00041.jpg)
 
 ---
@@ -27,7 +27,7 @@ A post-process plugin for Unreal Engine 5.6 that brings **Photo RAW style color 
 Runs **after** UE's built-in tonemapper on the already-processed LDR image. Safe, compatible, zero setup. Choose where to inject: after Tonemap, Motion Blur, FXAA, or at the very end.
 
 ### Replace Tonemapper Mode
-**Replaces UE's entire ACES pipeline.** Takes raw HDR scene color and maps it through a film curve. Eliminates ACES desaturation, glow artifacts, and red-shift. Full control over the HDR-to-LDR conversion with custom bloom and auto-exposure. Supports **HDR monitor output** — see HDR Output section below.
+**Replaces UE's entire ACES pipeline.** Takes raw HDR scene color and maps it through a film curve. Eliminates ACES desaturation, glow artifacts, and red-shift. Full control over the HDR-to-LDR/HDR conversion with custom bloom, auto-exposure, custom curves, and **HDR monitor output** — see HDR Output section below.
 
 ---
 
@@ -63,6 +63,17 @@ Reds / Oranges / Yellows / Greens / Aquas / Blues / Purples / Magentas
 
 Smooth feathering between adjacent ranges prevents hard color boundaries.
 
+Choose **Smooth** HSL weighting for softer transitions, or **Legacy** to preserve older project looks.
+
+### Actor Blending
+Multiple ToneMapFX actors/components can blend together in the same level.
+
+- **Global** - Applies everywhere with a weight and priority
+- **Bounding Box** - Applies inside a local box and fades out across a falloff distance
+- **Blend Priority** - Chooses the dominant component for enum/texture-driven features
+- **Actor Color Blend Space** - Legacy Linear RGB or Oklab for smoother color transitions between actors
+- **Show Blend Bounds** - Draws inner and falloff boxes in the viewport for setup/debugging
+
 ### Film Curves *(Replace Tonemapper Mode)*
 - **Hable** - Filmic curve with 7 adjustable parameters (shoulder, linear, toe, white point)
 - **Reinhard (Luminance)** - Preserves hue and saturation
@@ -71,6 +82,9 @@ Smooth feathering between adjacent ranges prevents hard color boundaries.
 - **Durand-Dorsey 2002 (Bilateral)** - Bilateral-filter tone mapping. Decomposes the scene log-luminance into a *base layer* (large-scale illumination) and a *detail layer* (fine structures). Compresses only the base layer, then recombines - preserving micro-contrast while reducing overall dynamic range. Configurable spatial sigma, range sigma, base compression factor, and detail boost.
 - **Fattal et al. 2002 (Gradient Domain)** (experimental) - Gradient-domain tone mapping. Attenuates large luminance gradients while leaving small ones intact. Implemented as a 4-pass RDG pipeline: attenuated gradient field -> divergence field -> iterative Jacobi Poisson solver -> tone-mapped reconstruction. Seeded from log-luminance for correct partial-convergence behavior. Configurable alpha/beta attenuation, noise floor, output saturation, and solver iteration count.
 - **AgX (Sobotka)** - Display rendering transform by Troy Sobotka. Inset matrix → log2 encoding → polynomial sigmoid tone curve → outset matrix. Preserves hue and saturation through highlight compression with minimal color clipping. Three creative looks: *None* (base), *Punchy* (vivid contrast), *Golden* (warm golden-hour). Configurable min/max EV encoding range.
+- **ACES Hill Fit** - Stephen Hill's ACES filmic approximation with ACES-style color transforms.
+- **ACES Narkowicz Fit** - Krzysztof Narkowicz's fast ACES filmic approximation.
+- **Custom Curve (Luminance)** - Uses a `CurveFloat` asset baked to a GPU texture. X maps across a configurable EV range; Y is output display-linear luminance and can exceed 1.0 in True HDR output.
 - **HDR Saturation & Color Balance** - Pre-curve adjustments in linear HDR
 
 ### Auto-Exposure *(Replace Tonemapper Mode)*
@@ -78,10 +92,10 @@ Smooth feathering between adjacent ranges prevents hard color boundaries.
 - **Engine Default** - UE's built-in eye adaptation remains active and passes exposure through.
 - **Krawczyk** (experimental) - Scene key estimation with temporal adaptation that mimics human eye behavior (fast bright-adapt, slow dark-adapt). UE's built-in exposure is disabled automatically.
 
-> **Exposure Independence:** When set to *Krawczyk* or *None*, ToneMapFX automatically neutralizes UE's entire exposure pipeline (forces `AEM_Manual`, zeros `AutoExposureBias`, disables physical camera exposure, and neutralizes local exposure contrast) so that only ToneMapFX controls the scene brightness.
+> **Exposure Independence:** When set to *Krawczyk* or *None*, ToneMapFX automatically neutralizes UE's entire exposure pipeline (forces `AEM_Manual`, zeros `AutoExposureBias`, disables physical camera exposure, and neutralizes local exposure settings) so that only ToneMapFX controls the scene brightness.
 
 ### Bloom
-Four bloom styles:
+Five bloom styles:
 
 | Mode | What it does |
 |------|--------------|
@@ -89,21 +103,27 @@ Four bloom styles:
 | **Directional Glare** | Star/cross streaks from bright areas |
 | **Kawase** | Progressive pyramid bloom (smooth, efficient) |
 | **Soft Focus** | Dreamy full-scene glow |
+| **Soft Focus Glow** | Dreamy full-scene glow with non-darkening soft-light composite |
 
-**Compositing:** 7 blend modes (Screen, Overlay, Soft Light, Hard Light, Lighten, Multiply, Additive) - color tinting - saturation - highlight protection - quality controls
+**Compositing:** 8 blend modes (Screen, Overlay, Soft Light, Hard Light, Lighten, Multiply, Additive, Soft Light Glow) - blend strength - color tinting - saturation - highlight protection - quality controls
+
+**Bloom Color Mode:** Scene Color preserves source color, Legacy Luminance restores the older monochrome bloom look, and Tint multiplies bloom by the selected tint color.
+
+**Bloom Blend Strength:** Separates bloom energy from blend-mode strength. `BloomIntensity` controls how much glow is generated; `BloomBlendStrength` controls how strongly the selected blend mode reshapes the final image.
 
 **Threshold:** Soft-knee quadratic threshold with configurable softness (eliminates hard cutoff circles around bright sources). MaxBrightness HDR clamp prevents banding/quantization rings from extreme values like the sun.
 
 **Directional Glare** now supports configurable sample count (8–64) for quality/performance trade-off.
 
 ### Sharpening
-Post-tonemapping unsharp mask to restore perceived detail after tone curves and color grading.
+Post-tonemapping sharpening to restore perceived detail after tone curves and color grading.
 
 - **Enable Sharpening** — toggles the sharpening pass on/off
-- **Sharpen Amount** (0–100) — intensity of the unsharp mask, default 50
-- **Sharpen Radius** (0.5–5.0) — sampling radius in pixels, default 1.0
+- **Sharpen Method** — choose **Legacy Unsharp Mask** or **AMD CAS** contrast-adaptive sharpening
+- **Sharpen Amount** (0–100) — intensity; for AMD CAS this maps to CAS sharpness
+- **Sharpen Radius** (0.5–5.0) — sampling radius in pixels for Legacy Unsharp Mask
 
-Uses a 9-tap kernel (center + 8 cross/diagonal neighbors). Placed after ToneMapProcess and before LUT in the pipeline.
+Legacy mode uses a 9-tap kernel (center + 8 cross/diagonal neighbors). AMD CAS uses a sharpen-only FidelityFX CAS-style contrast-adaptive filter integrated into the same pass. Placed after ToneMapProcess and before LUT in the pipeline.
 
 ### Processing Path (LUT Mode)
 Optional dual-path architecture for the main color grading pass.
@@ -118,7 +138,7 @@ Both paths produce virtually identical visual output. The LUT path trades ALU fo
 | Effect | Description |
 |--------|-------------|
 | **Ciliary Corona** | Diffraction spike streaks radiating from very bright light sources. Configurable spike count (2-16), length, threshold, and intensity. Check also very similar kawase bloom setting. |
-| **Lenticular Halo** | Physically-based scattering ring around bright sources. Uses chromatic dispersion - red channel sampled at a slightly larger radius, blue at a slightly smaller radius - producing a violet-inside/red-outside iridescent ring matching real lens coating behavior. Configurable radius, thickness, threshold, intensity, and tint. Can be used in some specific cases. |
+| **Lenticular Halo** | Lens-scatter halo around bright sources. Supports **Ring / Arcs** and **Stretched Lines** patterns, chromatic dispersion, irregularity, arc stretch, line count, line thickness, radius, thickness, threshold, intensity, and tint. |
 
 ### Vignette
 Screen-space darkening or lightening from edges with full creative control.
@@ -133,12 +153,16 @@ Screen-space darkening or lightening from edges with full creative control.
 ### HDR Output *(Replace Tonemapper Mode)*
 Optional HDR monitor support for the Replace Tonemapper pipeline.
 
-All film curves in ToneMapFX (Hable, Reinhard, Durand, Fattal, AgX) are **SDR tone curves by design** — they compress high-dynamic-range scene color into the standard sRGB [0, 1] range for SDR displays. However, when Replace Tonemapper mode is active, UE's built-in tonemapper (and its HDR output encoding) is completely bypassed. An HDR monitor would receive sRGB-encoded values with no way to interpret them as HDR — resulting in washed-out or dimly clipped output.
+Most film curves in ToneMapFX are **SDR tone curves by design** — they compress high-dynamic-range scene color into the standard display range for SDR displays. However, when Replace Tonemapper mode is active, UE's built-in tonemapper and HDR output encoding are bypassed. ToneMapFX therefore provides its own HDR output path.
 
-The **HDR Output** feature adds a dedicated final encoding pass that takes the plugin's sRGB output and re-encodes it into the display's native HDR format. The tone curves themselves remain unchanged — they still produce SDR tone-mapped results — but those results are correctly presented on an HDR display at the user's chosen brightness level.
+The **HDR Output** feature adds a dedicated final encoding pass and two output modes:
 
-- **HDR Output** checkbox — enables ST2084 (PQ) or scRGB encoding as a final pass after all processing (tone curve → LUT → Vignette → HDR encode). Automatically toggles `r.HDR.EnableHDROutput` to match.
-- **Paper White Nits** (80–500 cd/m²) — controls how bright the tone-mapped white point appears on the HDR display. 80 = sRGB reference white (dim), 200 = typical PC monitor, 400 = bright.
+- **Paper White Nits Mode** — encodes the existing SDR-style tone-mapped result for HDR presentation. 1.0 maps to Paper White Nits.
+- **True HDR Output** — preserves linear values above 1.0 through the final HDR encode. 1.0 maps to Paper White Nits; higher values use HDR highlight headroom.
+- **HDR Output** checkbox — enables ST2084 (PQ) or scRGB encoding as a final pass after all processing. Automatically toggles `r.HDR.EnableHDROutput` to match.
+- **Auto Detect HDR Display** — automatically enables effective HDR output when the active RHI/display supports HDR, and falls back to SDR when unavailable.
+- **Debug HDR Logging** — logs HDR request/effective state, output device, display nits, and True HDR state when values change.
+- **Paper White Nits** (80–500 cd/m²) — controls how bright reference white appears on the HDR display. 80 = sRGB reference white (dim), 200 = typical PC monitor, 400 = bright.
 - Supports both **HDR10** (ST2084/PQ with BT.2020 color space) and **Windows HDR** (scRGB).
 - Has no effect in Post-Process mode (UE's tonemapper already handles HDR encoding).
 
@@ -155,10 +179,13 @@ Save and load all ToneMapFX settings to `.txt` files using OS native file dialog
 - **Save Preset As** / **Load Preset** - Buttons in the actor and component Details panel
 - `SavePresetToPath()` / `LoadPresetFromPath()` - Blueprint-callable API
 - Reflection-based serialization — automatically handles all property types including enums, colors, textures, and vectors
+- Custom curve asset references and generated curve textures are rebuilt after loading
 - Presets are forward/backward compatible — unknown properties are skipped gracefully
 
 ### Engine Overrides
 - **Disable Unreal Bloom** - Zeros UE's `BloomIntensity` to prevent double-bloom when using ToneMapFX bloom (enabled by default)
+- **Disable Unreal Motion Blur** - Zeros UE's `MotionBlurAmount` and `MotionBlurMax` for clean ToneMapFX evaluation without temporal smearing
+- **Replace Tonemapper Cleanup** - Zeros UE's `ToneCurveAmount`, `ExpandGamut`, and `BlueCorrection` so the plugin owns the final film response
 - **Automatic Exposure Neutralization** - When exposure mode is *Krawczyk* or *None*, UE's entire exposure system is disabled (see Auto-Exposure section)
 - **Force FP16 Pipeline** - Forces UE's entire post-processing chain to use `PF_FloatRGBA` (FP16, 64bpp) precision by toggling `r.PostProcessing.PropagateAlpha` at runtime. Prevents banding from 10-bit/11-bit quantization in TAA/TSR and tonemapper output. Enabled by default. Doubles bandwidth of post-process passes — small cost on modern hardware, significant quality improvement in smooth gradients.
 
@@ -181,7 +208,7 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 ## Compiling
 
 ```bat
-.\Engine\Build\BatchFiles\Build.bat UnrealEditor Win64 Development -Plugin="YourDriveLetter\UnrealEngine-5.6.1-release\Engine\Plugins\Experimental\ToneMapFX\ToneMapFX.uplugin"
+.\Engine\Build\BatchFiles\Build.bat UnrealEditor Win64 Development -Plugin="YourDriveLetter\UnrealEngine-5.x-release\Engine\Plugins\Experimental\ToneMapFX\ToneMapFX.uplugin"
 ```
 ---
 
@@ -191,17 +218,21 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - [x] ~~Vignette~~ *(done — Circular/Square, 5 falloffs, texture mask)*
 - [x] ~~LUT import~~ *(done — 16³/32³/64³ LUT color grading)*
 - [x] ~~Bloom bugfixes~~ *(done — soft-knee threshold, MaxBrightness clamp, PF_FloatRGBA)*
-- [x] ~~HDR monitor output~~ *(done — ST2084/PQ + scRGB encoding, Paper White Nits, auto CVar toggle)*
+- [x] ~~HDR monitor output~~ *(done — ST2084/PQ + scRGB encoding, Paper White Nits, True HDR Output, auto-detect, debug logging)*
 - [x] ~~Camera Exposure settings~~ *(done — ShutterSpeedDenominator 1/X notation, EV100 inversion fix, standard stop tooltips)*
-- [x] ~~Sharpen~~ *(done — 9-tap unsharp mask with configurable amount and pixel radius)*
+- [x] ~~Sharpen~~ *(done — 9-tap unsharp mask and AMD CAS with configurable amount)*
 - [x] ~~Anti-banding / Dithering~~ *(done — last-pass-only dithering, PF_FloatRGBA intermediates, triangular-PDF noise, quantum auto-detect)*
 - [x] ~~Krawczyk flickering fix~~ *(done — DeltaTime clamped to 66ms)*
 - [x] ~~LUT Processing Path~~ *(done — 32³ baked LUT mode, dual-path Per-Pixel/LUT, CombineLUT+ApplyLUT shaders)*
 - [x] ~~FP16 Pipeline Override~~ *(done — Force FP16 Pipeline checkbox, r.PostProcessing.PropagateAlpha toggle, eliminates 10-bit/11-bit quantization)*
 - [x] ~~Dither Quantization Control~~ *(done — user-adjustable noise quantum slider, default 1/255)*
 - [x] ~~SMAA Compatibility Fix~~ *(done — quantized extent output texture, EClear gap pixels, FP16 format enforced, correct RTMetrics for all SMAA passes)*
+- [x] ~~Bounding box - multiple postprocess actors, blending across them~~ *(done — global/bounding-box blending with priority, falloff, and debug bounds)*
+- [x] ~~Custom luminance curve assets~~ *(done — CurveFloat baking to GPU texture with preset save/load support)*
+- [x] ~~Lenticular halo improvements~~ *(done — Ring / Arcs and Stretched Lines patterns with line count/thickness controls)*
+- [x] ~~Bloom compositing controls~~ *(done - Bloom Color Mode, Soft Light Glow, and Bloom Blend Strength)*
+- [x] ~~Unreal motion blur override~~ *(done - direct MotionBlurAmount/MotionBlurMax neutralization)*
 - [ ] LUT export
-- [ ] Bounding box - multiple postprocess actors, blending across them
 - [ ] Additional RGB curves
 - [ ] Texture overlay
 - [ ] Custom light shafts
@@ -212,6 +243,13 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 
 ### Tonemapping Operators
 - **[Tonemapping - 64.github.io](https://64.github.io/tonemapping/)** - Excellent overview of tonemapping operators including Reinhard, Reinhard-Jodie, and Hable (Uncharted 2). This plugin's film curve implementations are based on the formulas described here.
+
+### ACES Fit Curves
+- **[Stephen Hill / MJP - BakingLab ACES.hlsl](https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl)** - ACES fitted curve with input/output color transforms.
+- **[Krzysztof Narkowicz - ACES Filmic Tone Mapping Curve](https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/)** - Compact ACES filmic approximation used for the ACES Narkowicz fit.
+
+### Sharpening
+- **[AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS)** - Contrast Adaptive Sharpening reference implementation used as the basis for the AMD CAS sharpening option.
 
 ### Hable (Uncharted 2) Filmic Curve
 John Hable's filmic tonemapping curve, originally developed for *Uncharted 2*, uses a parametric function with 6 constants (Shoulder Strength, Linear Strength, Linear Angle, Toe Strength, Toe Numerator, Toe Denominator) plus a White Point. It produces a natural-looking film response with controllable shoulder rolloff, a linear middle region, and a lifted toe - closely matching how real film stock responds to light.
@@ -251,13 +289,9 @@ Key parameters: `Alpha` - gradient magnitude reference threshold (lower = more u
 
 ### HDR Output Encoding Standards
 The HDR encode pass uses publicly defined color science standards — no proprietary code:
-- **SMPTE ST 2084 (PQ)** — Perceptual Quantizer electro-optical transfer function for HDR10 displays. Maps linear luminance (0–10 000 cd/m²) to a perceptually uniform code-value range.
-- **ITU-R BT.2020** — Wide color gamut used by HDR10. The plugin applies the standard BT.709→BT.2020 color matrix.
-- **scRGB** — Microsoft's extended linear sRGB format for Windows HDR compositing. Values above 1.0 represent HDR luminance.
-
-- **[SMPTE ST 2084:2014](https://pub.smpte.org/doc/st2084/20140816-pub/)** — PQ EOTF specification
-- **[ITU-R BT.2020-2](https://www.itu.int/rec/R-REC-BT.2020)** — Ultra-high definition color space
-- **[scRGB (Microsoft)](https://en.wikipedia.org/wiki/ScRGB)** — Extended linear sRGB - check wiki references
+- **[SMPTE ST 2084:2014](https://pub.smpte.org/doc/st2084/20140816-pub/)** — Perceptual Quantizer electro-optical transfer function for HDR10 displays. Maps linear luminance (0–10 000 cd/m²) to a perceptually uniform code-value range.
+- **[ITU-R BT.2020-2](https://www.itu.int/rec/R-REC-BT.2020)** — Wide color gamut used by HDR10. The plugin applies the standard BT.709→BT.2020 color matrix.
+- **[scRGB (Microsoft)](https://en.wikipedia.org/wiki/ScRGB)** — Microsoft's extended linear sRGB format for Windows HDR compositing. Values above 1.0 represent HDR luminance.
 
 ### AgX Display Rendering Transform
 Based on Troy Sobotka's open-source AgX display rendering pipeline. Scene-linear RGB is transformed through an inset matrix (working space rotation), log2-encoded across a configurable EV range, shaped by a polynomial sigmoid tone curve, then transformed back through an outset matrix. The sigmoid preserves hue and saturation through highlight compression with minimal color clipping — a key advantage over ACES. Creative looks (Punchy, Golden) are applied as post-curve ASC-CDL-style transforms.

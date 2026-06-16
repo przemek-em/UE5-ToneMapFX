@@ -26,7 +26,10 @@ public:
 
 		SHADER_PARAMETER(float, SharpenAmount)
 		SHADER_PARAMETER(float, SharpenRadius)
+		SHADER_PARAMETER(float, SharpenMethod)
+		SHADER_PARAMETER(float, CASInputRange)
 		SHADER_PARAMETER(FVector2f, TexelSize)
+		SHADER_PARAMETER(float, bLinearHDROutput)
 		SHADER_PARAMETER(float, DitherQuantization) // 0=off, 1/255=8-bit, 1/1023=10-bit
 
 		RENDER_TARGET_BINDING_SLOTS()

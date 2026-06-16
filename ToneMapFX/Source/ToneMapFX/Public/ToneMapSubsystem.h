@@ -35,11 +35,32 @@ public:
 	virtual int32 GetPriority() const override { return 50; }
 
 private:
+	struct FHDRDebugState
+	{
+		bool bValid = false;
+		bool bRequested = false;
+		bool bEffective = false;
+		bool bAutoDetect = false;
+		bool bSupported = false;
+		bool bAllowed = false;
+		bool bNoHDRCommandLine = false;
+		bool bWantEncode = false;
+		bool bNeedEncode = false;
+		bool bLinearOutput = false;
+		int32 CVarValue = -1;
+		uint32 OutputDevice = 0;
+		uint8 OutputMode = 0;
+		float OutputMaxLuminance = -1.0f;
+		float PaperWhiteNits = -1.0f;
+	};
+
 	TWeakObjectPtr<UToneMapSubsystem> WeakSubsystem;
 
 	// Cached mode from game thread (read in SetupView)
 	bool bCachedReplaceTonemap = false;
 	bool bCachedHDROutput = false;
+	FHDRDebugState LastHDRSetupDebugState;
+	FHDRDebugState LastHDRRenderDebugState;
 
 	// Persistent adapted luminance for Krawczyk auto-exposure (survives across frames)
 	TRefCountPtr<IPooledRenderTarget> AdaptedLuminanceRT;

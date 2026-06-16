@@ -20,8 +20,13 @@ Texture2D    BrightPassTexture;
 SamplerState BrightPassSampler;
 FScreenTransform SvPositionToBrightPassUV;
 float4       BufferSizeAndInvSize;
+float        HaloPattern;
 float        HaloRadius;    // nominal radius (UV units, e.g. 0.15)
 float        HaloThickness; // radial spread of each channel's Gaussian (UV units, e.g. 0.03)
+float        HaloIrregularity;
+float        HaloArcStretch;
+int          HaloLineCount;
+float        HaloLineThickness;
 float        HaloIntensity;
 float3       HaloTint;
 
@@ -29,11 +34,94 @@ float3       HaloTint;
 #define HALO_ANGULAR_SAMPLES 32
 // 5 radial sub-steps per channel — smooth Gaussian profile across ring thickness
 #define HALO_RADIAL_STEPS    5
+#define HALO_LINE_MAX        12
+#define HALO_LINE_STEPS      18
 
 // Chromatic dispersion: how much the radius shifts per channel.
 // Red samples farthest out, blue closest in.
 // Offset is expressed as a fraction of HaloThickness.
-#define HALO_CHROMA_OFFSET   0.6
+#define HALO_CHROMA_OFFSET   0.42
+
+float HaloEdgeFade(float2 sampleUV)
+{
+	float2 pixelDistanceToEdge = min(sampleUV, 1.0f - sampleUV) * BufferSizeAndInvSize.xy;
+	float2 fade = saturate(pixelDistanceToEdge);
+	return fade.x * fade.y;
+}
+
+float3 SampleHaloBright(float2 sampleUV)
+{
+	return Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, sampleUV, 0).rgb * HaloEdgeFade(sampleUV);
+}
+
+float HaloWave(float theta)
+{
+	return sin(theta * 2.13f + 0.37f) * 0.50f
+		+ sin(theta * 5.07f + 1.91f) * 0.32f
+		+ sin(theta * 9.21f + 2.63f) * 0.18f;
+}
+
+float HaloAngularWeight(float theta, float irregularity, float arcStretch)
+{
+	float shortArc = sin(theta * 7.0f + 0.41f) * 0.55f + sin(theta * 13.0f + 2.17f) * 0.45f;
+	float longArc = sin(theta * 2.0f + 0.73f) * 0.60f + sin(theta * 3.0f + 2.91f) * 0.40f;
+	float arc = lerp(shortArc, longArc, arcStretch);
+	float band = smoothstep(-0.35f, 0.85f, arc);
+	return lerp(1.0f, lerp(0.38f, 1.42f, band), irregularity);
+}
+
+float3 AccumulateHaloLines(float2 uv, float aspectRatio, float irregularity, float arcStretch)
+{
+	int lineCount = min(max(HaloLineCount, 1), HALO_LINE_MAX);
+	float lineLength = max(HaloRadius, HaloThickness * 2.0f);
+	float lineWidth = max(HaloLineThickness * BufferSizeAndInvSize.w, BufferSizeAndInvSize.w * 0.5f);
+	float3 accum = 0.0f;
+	float totalW = 0.0f;
+	float baseRotation = irregularity * 0.37f;
+
+	LOOP
+	for (int lineIdx = 0; lineIdx < HALO_LINE_MAX; ++lineIdx)
+	{
+		if (lineIdx >= lineCount)
+		{
+			continue;
+		}
+
+		float linePhase = (float(lineIdx) + 0.5f * irregularity * HaloWave(float(lineIdx) + 1.17f)) / float(lineCount);
+		float theta = linePhase * 3.14159265f + baseRotation;
+		float2 dir = float2(cos(theta) / aspectRatio, sin(theta));
+		float2 tangent = float2(-sin(theta) / aspectRatio, cos(theta));
+		float lineW = HaloAngularWeight(theta, irregularity, arcStretch);
+		float maxDist = lineLength * max(1.0f + irregularity * 0.25f * HaloWave(theta + 2.23f), 0.35f);
+		float widthScale = max(1.0f + irregularity * 0.35f * HaloWave(theta + 0.91f), 0.35f);
+
+		LOOP
+		for (int s = 0; s < HALO_LINE_STEPS; ++s)
+		{
+			float u = (float(s) + 0.5f) / float(HALO_LINE_STEPS);
+			float dist = maxDist * pow(u, lerp(1.25f, 0.78f, arcStretch));
+			float taper = smoothstep(0.02f, 0.12f, u) * pow(1.0f - u, lerp(1.60f, 0.35f, arcStretch));
+			float chroma = (u - 0.5f) * 0.20f;
+			float3 spectral = saturate(float3(1.0f + chroma, 1.0f, 1.0f - chroma));
+
+			UNROLL
+			for (int w = 0; w < 3; ++w)
+			{
+				float wt = float(w) - 1.0f;
+				float widthW = exp(-wt * wt * 0.75f);
+				float2 widthOffset = tangent * (wt * lineWidth * widthScale);
+				float sampleW = lineW * taper * widthW;
+				float3 cFwd = SampleHaloBright(uv + dir * dist + widthOffset);
+				float3 cBwd = SampleHaloBright(uv - dir * dist + widthOffset);
+				accum += (cFwd + cBwd) * (sampleW * spectral);
+				totalW += 2.0f * sampleW;
+			}
+		}
+	}
+
+	float3 lineHalo = (totalW > 1e-6f) ? (accum / totalW) : 0.0f;
+	return lineHalo * lerp(1.0f, 1.35f, arcStretch);
+}
 
 void HaloRingPS(
 	float4 SvPosition : SV_Position,
@@ -43,6 +131,15 @@ void HaloRingPS(
 
 	float aspectRatio = BufferSizeAndInvSize.x / max(BufferSizeAndInvSize.y, 1.0f);
 	float angStep     = 6.28318530f / float(HALO_ANGULAR_SAMPLES);
+	float irregularity = saturate(HaloIrregularity);
+	float arcStretch = saturate(HaloArcStretch);
+
+	if (HaloPattern > 0.5f)
+	{
+		float3 haloLines = AccumulateHaloLines(uv, aspectRatio, irregularity, arcStretch);
+		OutHalo = float4(haloLines * HaloIntensity * HaloTint, 1.0f);
+		return;
+	}
 
 	// Per-channel radii: blue < green < red (chromatic dispersion)
 	float chromaShift = HaloThickness * HALO_CHROMA_OFFSET;
@@ -56,24 +153,33 @@ void HaloRingPS(
 	float halfThick = HaloThickness * 0.5f;
 
 	float3 accumR = 0.0f, accumG = 0.0f, accumB = 0.0f;
+	float3 veilAccum = 0.0f;
 	float  totalW = 0.0f;
+	float  veilW = 0.0f;
 
 	LOOP
 	for (int a = 0; a < HALO_ANGULAR_SAMPLES; ++a)
 	{
 		float  theta = float(a) * angStep;
 		float2 dir   = float2(cos(theta) / aspectRatio, sin(theta));
+		float2 tangent = float2(-sin(theta) / aspectRatio, cos(theta));
+		float angleW = HaloAngularWeight(theta, irregularity, arcStretch);
+		float radiusJitter = HaloThickness * irregularity * HaloWave(theta);
+		float tangentJitter = HaloThickness * irregularity * arcStretch * 0.65f * HaloWave(theta + 1.71f);
+		float localHalfThick = halfThick * (1.0f + irregularity * arcStretch * (0.40f + 0.20f * HaloWave(theta + 0.83f)));
 
 		UNROLL
 		for (int r = 0; r < HALO_RADIAL_STEPS; ++r)
 		{
 			float t = (float(r) / float(HALO_RADIAL_STEPS - 1)) * 2.0f - 1.0f; // [-1, 1]
-			float w = exp(t * t * invSig2);
+			float radialOffset = t * localHalfThick;
+			float w = exp(radialOffset * radialOffset * invSig2) * angleW;
 
 			// Each channel samples at its own chromatic radius
-			float3 cR = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uv + dir * (R_r + t * halfThick), 0).rgb;
-			float3 cG = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uv + dir * (R_g + t * halfThick), 0).rgb;
-			float3 cB = Texture2DSampleLevel(BrightPassTexture, BrightPassSampler, uv + dir * (R_b + t * halfThick), 0).rgb;
+			float2 flow = tangent * tangentJitter;
+			float3 cR = SampleHaloBright(uv + dir * max(R_r + radiusJitter + radialOffset, 0.0f) + flow);
+			float3 cG = SampleHaloBright(uv + dir * max(R_g + radiusJitter * 0.80f + radialOffset, 0.0f) + flow);
+			float3 cB = SampleHaloBright(uv + dir * max(R_b + radiusJitter * 0.65f + radialOffset, 0.0f) + flow);
 
 			// Extract only the relevant channel from each sample — we want R from red-radius,
 			// G from green-radius, B from blue-radius.  This is the dispersed contribution.
@@ -81,6 +187,10 @@ void HaloRingPS(
 			accumG += cG * w;
 			accumB += cB * w;
 			totalW += w;
+
+			float veilWeight = w * 0.18f * (1.0f - abs(t));
+			veilAccum += (cR + cG + cB) * (veilWeight * (1.0f / 3.0f));
+			veilW += veilWeight;
 		}
 	}
 
@@ -92,6 +202,9 @@ void HaloRingPS(
 		accumR.r * normScale,
 		accumG.g * normScale,
 		accumB.b * normScale);
+
+	float3 veil = (veilW > 1e-6f) ? (veilAccum / veilW) : 0.0f;
+	halo = halo * 0.82f + veil * 0.18f;
 
 	OutHalo = float4(halo * HaloIntensity * HaloTint, 1.0f);
 }

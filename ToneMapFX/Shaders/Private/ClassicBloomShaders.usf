@@ -18,6 +18,21 @@ float BloomIntensity;
 float ThresholdSoftness;  // 0..1  — 0 = hard cutoff, 1 = very wide/soft transition
 float MaxBrightness;      // Clamp extreme HDR values to prevent banding artifacts (0 = no clamp)
 
+float3 ClampBloomMaxBrightness(float3 Bloom, float MaxValue)
+{
+	if (MaxValue <= 0.0)
+	{
+		return Bloom;
+	}
+
+	float Peak = max(max(Bloom.r, Bloom.g), Bloom.b);
+	if (Peak > MaxValue)
+	{
+		Bloom *= MaxValue / Peak;
+	}
+	return Bloom;
+}
+
 // Soft-knee threshold — identical maths to the Kawase path so the two modes
 // produce a consistent look.  Creates a smooth quadratic ramp instead of
 // a hard step, completely eliminating the "cutoff circle" artifact that the
@@ -69,14 +84,7 @@ void BrightPassPS(
 	// Clamp extreme HDR values — prevents a single super-bright texel from
 	// dominating the blur and creating visible banding rings.
 	// This is the non-Kawase equivalent of the Karis average.
-	if (MaxBrightness > 0.0)
-	{
-		float Lum = dot(Bloom, float3(0.299, 0.587, 0.114));
-		if (Lum > MaxBrightness)
-		{
-			Bloom *= MaxBrightness / Lum;
-		}
-	}
+	Bloom = ClampBloomMaxBrightness(Bloom, MaxBrightness);
 	
 	OutColor = float4(Bloom, 1.0);
 }

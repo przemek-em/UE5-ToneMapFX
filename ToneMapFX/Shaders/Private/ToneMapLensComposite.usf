@@ -17,6 +17,13 @@ FScreenTransform SvPositionToLensUV;
 float        bEnableCorona;
 float        bEnableHalo;
 
+float3 AddLensEffect(float3 scene, float3 effect)
+{
+	float sceneLum = dot(max(scene, 0.0f), float3(0.2126f, 0.7152f, 0.0722f));
+	float compression = rcp(1.0f + sceneLum * 0.15f);
+	return scene + effect * compression;
+}
+
 void LensCompositePS(
 	float4 SvPosition : SV_Position,
 	out float4 OutColor : SV_Target0)
@@ -29,13 +36,13 @@ void LensCompositePS(
 	if (bEnableCorona > 0.5f)
 	{
 		float3 corona = Texture2DSample(CoronaTexture, CoronaSampler, uvLens).rgb;
-		result = result + corona * max(1.0f - result, 0.0f);
+		result = AddLensEffect(result, corona);
 	}
 
 	if (bEnableHalo > 0.5f)
 	{
 		float3 halo = Texture2DSample(HaloTexture, HaloSampler, uvLens).rgb;
-		result = result + halo * max(1.0f - result, 0.0f);
+		result = AddLensEffect(result, halo);
 	}
 
 	OutColor = float4(result, 1.0f);

@@ -31,6 +31,7 @@ float InvLUTSize;  // 1.0 / 32.0
 
 // Mode: 0 = PostProcess (LDR), 1 = ReplaceTonemap (HDR)
 float bReplaceTonemap;
+float bLinearHDROutput;
 
 // Bloom (ReplaceTonemap mode)
 Texture2D    BloomTexture;
@@ -243,7 +244,7 @@ void ApplyLUTPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target
 			float lutLuma = max(Luma(lutResult), 0.0001);
 			float gradeRatio = lutLuma / neutralLuma;
 			lutResult = preTM * gradeRatio;
-			lutResult = saturate(lutResult);
+			lutResult = (bLinearHDROutput > 0.5) ? max(lutResult, 0.0) : saturate(lutResult);
 		}
 
 		color = lutResult;
@@ -357,6 +358,6 @@ void ApplyLUTPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target
 		color += (n1 + n2 - 1.0) * DitherQuantization;
 	}
 
-	color = saturate(color);
+	color = (bLinearHDROutput > 0.5 && bReplaceTonemap > 0.5) ? max(color, 0.0) : saturate(color);
 	OutColor = float4(color, 1.0);
 }

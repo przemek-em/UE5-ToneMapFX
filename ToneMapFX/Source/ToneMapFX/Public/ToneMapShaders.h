@@ -62,16 +62,20 @@ public:
 
 		// Mode: 0 = PostProcess (LDR), 1 = ReplaceTonemap (HDR)
 		SHADER_PARAMETER(float, bReplaceTonemap)
+		SHADER_PARAMETER(float, bLinearHDROutput)
 
 		// Exposure removal (ReplaceTonemap mode)
 		SHADER_PARAMETER(float, OneOverPreExposure)
 		SHADER_PARAMETER(float, GlobalExposure)
 
 		// Film Curve params (ReplaceTonemap mode)
-		SHADER_PARAMETER(float, FilmCurveMode) // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX
+		SHADER_PARAMETER(float, FilmCurveMode) // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX, 7=ACESHill, 8=ACESNarkowicz, 9=CustomLuminance
 		SHADER_PARAMETER(FVector4f, HableParams1) // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 		SHADER_PARAMETER(FVector4f, HableParams2) // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
 		SHADER_PARAMETER(float, ReinhardWhitePoint)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CustomCurveTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, CustomCurveSampler)
+		SHADER_PARAMETER(FVector4f, CustomCurveParams) // x=MinEV, y=InvEVRange, zw=unused
 		SHADER_PARAMETER(float, HDRSaturation)
 		SHADER_PARAMETER(FVector3f, HDRColorBalance)
 
@@ -144,6 +148,7 @@ public:
 
 		// HSL range smoothing
 		SHADER_PARAMETER(float, HSLSmoothing)
+		SHADER_PARAMETER(float, HSLMode) // 0=Smooth, 1=Legacy
 
 		// Feature toggles
 		SHADER_PARAMETER(float, bEnableHSL)

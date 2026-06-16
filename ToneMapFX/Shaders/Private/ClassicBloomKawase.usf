@@ -21,6 +21,7 @@ float4 OutputSizeAndInvSize; // Output/destination size (for UV calculation from
 FScreenTransform SvPositionToSourceUV; // Transform SvPosition to source texture UV (handles viewport offsets)
 float BloomThreshold;
 float ThresholdKnee;
+float MaxBrightness;
 int MipLevel;
 int bUseKarisAverage;
 
@@ -75,6 +76,21 @@ float3 SoftThreshold(float3 color, float threshold, float knee)
     contribution /= max(brightness, 0.00001);
     
     return color * contribution;
+}
+
+float3 ClampBloomMaxBrightness(float3 bloom, float maxValue)
+{
+    if (maxValue <= 0.0)
+    {
+        return bloom;
+    }
+
+    float peak = max(max(bloom.r, bloom.g), bloom.b);
+    if (peak > maxValue)
+    {
+        bloom *= maxValue / peak;
+    }
+    return bloom;
 }
 
 // ============================================================================
@@ -171,6 +187,11 @@ void KawaseDownsamplePS(
             downsample *= step(BloomThreshold, brightness);
         }
     }
+
+    if (MipLevel == 0)
+    {
+        downsample = ClampBloomMaxBrightness(downsample, MaxBrightness);
+    }
     
     // Prevent completely black pixels that cause artifacts during upsampling
     downsample = max(downsample, 0.0001);
@@ -224,6 +245,9 @@ void KawaseUpsamplePS(
     // Add contribution from the previous (larger) mip level
     float3 previousMip = Texture2DSample(PreviousMipTexture, SourceSampler, UV).rgb;
     
-    // Additive blend - this is what creates the characteristic bloom spread
-    OutColor = float4(previousMip + upsample, 1.0);
+    // Additive blend - this is what creates the characteristic bloom spread.
+    // Clamp after accumulation as well as extraction so BloomMaxBrightness is
+    // an effective cap for the final Kawase bloom texture.
+    float3 combined = ClampBloomMaxBrightness(previousMip + upsample, MaxBrightness);
+    OutColor = float4(combined, 1.0);
 }

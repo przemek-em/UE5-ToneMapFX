@@ -29,6 +29,7 @@ public:
 		// x = Mode (0=Circular, 1=Square), y = Size (0-100), z = Intensity (-100..100), w = FalloffMode (0-4)
 		SHADER_PARAMETER(FVector4f, VignetteParams)
 		SHADER_PARAMETER(float, FalloffExponent) // Custom power curve exponent
+		SHADER_PARAMETER(float, bLinearHDROutput)
 
 		// Alpha texture mask (optional)
 		SHADER_PARAMETER(float, bUseAlphaTexture)

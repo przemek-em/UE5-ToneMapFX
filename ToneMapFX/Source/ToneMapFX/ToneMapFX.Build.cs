@@ -21,14 +21,17 @@ public class ToneMapFX : ModuleRules
 			}
 		);
 
-		PrivateDependencyModuleNames.AddRange(
-			new string[]
-			{
-				"Slate",
-				"SlateCore",
-				"DesktopPlatform"
-			}
-		);
+		if (Target.bCompileAgainstEditor)
+		{
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"Slate",
+					"SlateCore",
+					"DesktopPlatform"
+				}
+			);
+		}
 
 		// Access to private/internal Renderer headers (FViewInfo, SceneRendering, etc.)
 		string RendererBase = System.IO.Path.Combine(EngineDirectory, "Source/Runtime/Renderer");

@@ -75,7 +75,9 @@ public:
 		SHADER_PARAMETER(FScreenTransform, SvPositionToBloomUV) // Transform SvPosition to bloom texture UV
 		SHADER_PARAMETER(float, BloomIntensity)
 		SHADER_PARAMETER(FVector4f, BloomTint)
-		SHADER_PARAMETER(float, BloomBlendMode) // 0=Screen, 1=Overlay, 2=SoftLight, 3=HardLight, 4=Lighten, 5=Multiply
+		SHADER_PARAMETER(float, BloomColorMode) // 0=SceneColor, 1=LegacyLuminance, 2=Tint
+		SHADER_PARAMETER(float, BloomBlendMode) // 0=Screen, 1=Overlay, 2=SoftLight, 3=HardLight, 4=Lighten, 5=Multiply, 6=Additive, 7=SoftLightGlow
+		SHADER_PARAMETER(float, BloomBlendStrength) // 0=original scene, 1=full blend-mode result
 		SHADER_PARAMETER(float, BloomSaturation) // Saturation multiplier for bloom colors
 		SHADER_PARAMETER(float, bProtectHighlights) // 1.0 = enabled, 0.0 = disabled
 		SHADER_PARAMETER(float, HighlightProtection) // Strength of highlight protection (0.0-1.0)
@@ -170,6 +172,7 @@ public:
 		SHADER_PARAMETER(FScreenTransform, SvPositionToSourceUV) // Transform SvPosition to source texture UV
 		SHADER_PARAMETER(float, BloomThreshold)
 		SHADER_PARAMETER(float, ThresholdKnee)
+		SHADER_PARAMETER(float, MaxBrightness) // Clamp extreme HDR values (0=no clamp)
 		SHADER_PARAMETER(int32, MipLevel) // 0 = first downsample (apply threshold), >0 = subsequent
 		SHADER_PARAMETER(int32, bUseKarisAverage) // 1 = apply Karis average (first mip only)
 		RENDER_TARGET_BINDING_SLOTS()
@@ -195,6 +198,7 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, SourceSampler)
 		SHADER_PARAMETER(FVector4f, OutputSizeAndInvSize) // Output viewport size for UV calculation
 		SHADER_PARAMETER(float, FilterRadius) // Radius in texture coordinates
+		SHADER_PARAMETER(float, MaxBrightness) // Clamp accumulated bloom values (0=no clamp)
 		RENDER_TARGET_BINDING_SLOTS()
 	END_SHADER_PARAMETER_STRUCT()
 

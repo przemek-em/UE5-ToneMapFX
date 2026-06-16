@@ -36,6 +36,7 @@ FScreenTransform SvPositionToBloomUV;
 
 // Mode: 0 = PostProcess (LDR), 1 = ReplaceTonemap (HDR)
 float bReplaceTonemap;
+float bLinearHDROutput;
 
 // Exposure removal (ReplaceTonemap mode)
 float OneOverPreExposure;
@@ -44,8 +45,11 @@ float GlobalExposure;
 // Hable Film Curve params (ReplaceTonemap mode)
 float4 HableParams1;   // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 float4 HableParams2;   // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
-float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX
+float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX, 7=ACESHill, 8=ACESNarkowicz, 9=CustomLuminance
 float  ReinhardWhitePoint; // Extended Reinhard L_white
+Texture2D    CustomCurveTexture;
+SamplerState CustomCurveSampler;
+float4 CustomCurveParams; // x=MinEV, y=InvEVRange, zw=unused
 float  HDRSaturation;
 float3 HDRColorBalance;
 
@@ -115,6 +119,7 @@ float4 LumAdj2;
 
 // HSL range smoothing
 float HSLSmoothing;    // 0 = sharpest cutoff, 100 = smoothest feather
+float HSLMode;         // 0 = Smooth/current, 1 = Legacy
 
 // Feature toggles
 float bEnableHSL;
@@ -411,58 +416,79 @@ float3 HSLToRGB(float3 hsl)
 }
 
 // --- Hue-range weight with wrap-around and adjustable smoothing ---
-// innerEdge = where weight starts falling off, outerEdge = where it reaches zero.
-// Uses a double-smoothstep for a bell-curve shape with controllable width.
+// Uses a circular Gaussian kernel so weights never hard-pop at range edges.
+// The eight colour ranges form a smooth partition around the hue wheel after
+// normalisation in ApplyHSL.
 
-float HueRangeWeight(float hue, float center, float halfWidth, float feather)
+float HueRangeWeightSmooth(float hue, float center, float halfWidth, float feather)
 {
 	float dist = abs(hue - center);
 	dist = min(dist, 1.0 - dist);   // handle 0/1 wrap
 
-	// innerEdge: the hard selection core (sharpest selection)
-	// outerEdge: the soft falloff boundary
-	// feather (0..1) blends between sharp and smooth
-	float sharpWidth  = halfWidth * 0.3;  // tight selection
-	float smoothWidth = halfWidth * 2.5;  // wide feathered selection
-	float activeWidth  = lerp(sharpWidth, smoothWidth, feather);
+	float sigma = max(lerp(halfWidth * 0.55, halfWidth * 1.85, feather), 0.025);
+	float x = dist / sigma;
+	return exp(-0.5 * x * x);
+}
 
-	// Smooth bell-curve: 1 at center, 0 at activeWidth
-	return smoothstep(activeWidth, activeWidth * 0.15, dist);
+float HueRangeWeightLegacy(float hue, float center, float halfWidth, float feather)
+{
+	float dist = abs(hue - center);
+	dist = min(dist, 1.0 - dist);
+
+	float featherWidth = lerp(0.005, halfWidth * 1.25, feather);
+	return 1.0 - smoothstep(halfWidth, halfWidth + featherWidth, dist);
+}
+
+float HueRangeWeight(float hue, float center, float halfWidth, float feather, float hslMode)
+{
+	return (hslMode < 0.5)
+		? HueRangeWeightSmooth(hue, center, halfWidth, feather)
+		: HueRangeWeightLegacy(hue, center, halfWidth, feather);
+}
+
+float ApplySoftLightness(float lightness, float adjustment)
+{
+	float amount = clamp(adjustment * 0.01, -1.0, 1.0);
+	if (abs(amount) < 0.0001)
+	{
+		return lightness;
+	}
+
+	float safeLightness = clamp(lightness, 0.0001, 0.9999);
+	float logit = log(safeLightness / (1.0 - safeLightness));
+	return 1.0 / (1.0 + exp(-(logit + amount * 2.4)));
 }
 
 float3 ApplyHSL(float3 color,
 				float4 hueShift1, float4 hueShift2,
 				float4 satAdj1,   float4 satAdj2,
 				float4 lumAdj1,   float4 lumAdj2,
-				float smoothing)
+				float smoothing,
+				float hslMode)
 {
 	// Handle HDR: normalise into 0-1 range, remember peak
 	float peak = max(max(color.r, color.g), color.b);
-	float restoreScale = max(peak, 0.0001);
 	float3 normColor = (peak > 1.0) ? color / peak : color;
 
 	float3 hsl = RGBToHSL(normColor);
-
-	// Skip achromatic pixels (no meaningful hue)
-	if (hsl.y < 0.01)
-		return color;
+	float chromaMask = (hslMode < 0.5) ? smoothstep(0.005, 0.05, hsl.y) : 1.0;
 
 	// Feather amount: 0 = sharpest, 1 = smoothest
 	float feather = saturate(smoothing * 0.01);
 
 	// Hue centres (0-1 range): Reds 0, Oranges 30°, Yellows 60°, Greens 120°,
 	//                          Aquas 180°, Blues 240°, Purples 285°, Magentas 330°
-	float w0 = HueRangeWeight(hsl.x, 0.000, 0.069, feather);  // Reds
-	float w1 = HueRangeWeight(hsl.x, 0.083, 0.069, feather);  // Oranges
-	float w2 = HueRangeWeight(hsl.x, 0.167, 0.069, feather);  // Yellows
-	float w3 = HueRangeWeight(hsl.x, 0.333, 0.100, feather);  // Greens
-	float w4 = HueRangeWeight(hsl.x, 0.500, 0.083, feather);  // Aquas
-	float w5 = HueRangeWeight(hsl.x, 0.667, 0.083, feather);  // Blues
-	float w6 = HueRangeWeight(hsl.x, 0.792, 0.069, feather);  // Purples
-	float w7 = HueRangeWeight(hsl.x, 0.917, 0.069, feather);  // Magentas
+	float w0 = HueRangeWeight(hsl.x, 0.000, 0.069, feather, hslMode);  // Reds
+	float w1 = HueRangeWeight(hsl.x, 0.083, 0.069, feather, hslMode);  // Oranges
+	float w2 = HueRangeWeight(hsl.x, 0.167, 0.069, feather, hslMode);  // Yellows
+	float w3 = HueRangeWeight(hsl.x, 0.333, 0.100, feather, hslMode);  // Greens
+	float w4 = HueRangeWeight(hsl.x, 0.500, 0.083, feather, hslMode);  // Aquas
+	float w5 = HueRangeWeight(hsl.x, 0.667, 0.083, feather, hslMode);  // Blues
+	float w6 = HueRangeWeight(hsl.x, 0.792, 0.069, feather, hslMode);  // Purples
+	float w7 = HueRangeWeight(hsl.x, 0.917, 0.069, feather, hslMode);  // Magentas
 
 	float wTotal = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
-	float invW   = (wTotal > 0.001) ? 1.0 / wTotal : 0.0;
+	float invW   = 1.0 / max(wTotal, 0.0001);
 
 	// Weighted-sum adjustments
 	float hueAdj = (w0 * hueShift1.x + w1 * hueShift1.y + w2 * hueShift1.z + w3 * hueShift1.w
@@ -477,10 +503,13 @@ float3 ApplyHSL(float3 color,
 	// Apply — values come in as -100..+100, normalise here
 	hsl.x = frac(hsl.x + hueAdj * 0.002);           // ±0.2 hue range = ±72°
 	hsl.y = saturate(hsl.y * (1.0 + satMod * 0.01)); // multiplicative sat
-	hsl.z = saturate(hsl.z * (1.0 + lumMod * 0.01)); // multiplicative lum
+	hsl.z = (hslMode < 0.5)
+		? ApplySoftLightness(hsl.z, lumMod)
+		: saturate(hsl.z * (1.0 + lumMod * 0.01));
 
 	float3 result = HSLToRGB(hsl);
-	return result * ((peak > 1.0) ? peak : 1.0);
+	result *= ((peak > 1.0) ? peak : 1.0);
+	return lerp(color, result, chromaMask);
 }
 
 // ============================================================================
@@ -540,7 +569,7 @@ float3 ApplySaturation(float3 color, float saturation)
 // The sum B0+B1+B2+B3 ≡ 1, giving smooth partition-of-unity blending.
 // ============================================================================
 
-float ApplyParametricCurve(float x, float4 params)
+float ParametricCurveAdjustment(float t, float4 params)
 {
 	// params: x = Highlights, y = Lights, z = Darks, w = Shadows  (each -100..+100)
 	float h = params.x * 0.01;
@@ -548,7 +577,6 @@ float ApplyParametricCurve(float x, float4 params)
 	float d = params.z * 0.01;
 	float s = params.w * 0.01;
 
-	float t   = saturate(x);
 	float omt = 1.0 - t;
 
 	float B0 = omt * omt * omt;
@@ -556,8 +584,19 @@ float ApplyParametricCurve(float x, float4 params)
 	float B2 = 3.0 * t * t * omt;
 	float B3 = t * t * t;
 
-	float adjustment = s * B0 + d * B1 + l * B2 + h * B3;
-	return saturate(t + adjustment * 0.5);
+	return s * B0 + d * B1 + l * B2 + h * B3;
+}
+
+float ApplyParametricCurve(float x, float4 params)
+{
+	float t = saturate(x);
+	return saturate(t + ParametricCurveAdjustment(t, params) * 0.5);
+}
+
+float ApplyParametricCurveLinearHDR(float x, float4 params)
+{
+	float t = saturate(x);
+	return max(x + ParametricCurveAdjustment(t, params) * 0.5, 0.0);
 }
 
 float3 ApplyToneCurve(float3 color, float4 params)
@@ -565,6 +604,14 @@ float3 ApplyToneCurve(float3 color, float4 params)
 	color.r = ApplyParametricCurve(color.r, params);
 	color.g = ApplyParametricCurve(color.g, params);
 	color.b = ApplyParametricCurve(color.b, params);
+	return color;
+}
+
+float3 ApplyToneCurveLinearHDR(float3 color, float4 params)
+{
+	color.r = ApplyParametricCurveLinearHDR(color.r, params);
+	color.g = ApplyParametricCurveLinearHDR(color.g, params);
+	color.b = ApplyParametricCurveLinearHDR(color.b, params);
 	return color;
 }
 
@@ -767,6 +814,61 @@ float3 AgXToneMap(float3 color, float4 agxParams)
 	return color;
 }
 
+// ACES fit tone curves
+// https://github.com/TheRealMJP/BakingLab/blob/master/BakingLab/ACES.hlsl MIT license
+// https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/ CC0/MIT license
+float3 ACESNarkowiczToneMap(float3 color)
+{
+	const float A = 2.51;
+	const float B = 0.03;
+	const float C = 2.43;
+	const float D = 0.59;
+	const float E = 0.14;
+	return saturate((color * (A * color + B)) / (color * (C * color + D) + E));
+}
+
+static const float3x3 ACESInputMatrix = float3x3(
+	0.59719, 0.35458, 0.04823,
+	0.07600, 0.90834, 0.01566,
+	0.02840, 0.13383, 0.83777
+);
+
+static const float3x3 ACESOutputMatrix = float3x3(
+	 1.60475, -0.53108, -0.07367,
+	-0.10208,  1.10813, -0.00605,
+	-0.00327, -0.07276,  1.07602
+);
+
+float3 ACESRRTAndODTFit(float3 color)
+{
+	float3 a = color * (color + 0.0245786) - 0.000090537;
+	float3 b = color * (0.983729 * color + 0.4329510) + 0.238081;
+	return a / max(b, 1e-6);
+}
+
+float3 ACESHillToneMap(float3 color)
+{
+	color = mul(ACESInputMatrix, color);
+	color = ACESRRTAndODTFit(color);
+	color = mul(ACESOutputMatrix, color);
+	return saturate(color);
+}
+
+float SampleCustomToneCurve(float luminance)
+{
+	float ev = log2(max(luminance, 1e-6));
+	float u = saturate((ev - CustomCurveParams.x) * CustomCurveParams.y);
+	return max(Texture2DSampleLevel(CustomCurveTexture, CustomCurveSampler, float2(u, 0.5), 0).r, 0.0);
+}
+
+float3 CustomLuminanceToneMap(float3 color)
+{
+	const float3 LuminanceWeights = float3(0.2126, 0.7152, 0.0722);
+	float sourceLuminance = max(dot(color, LuminanceWeights), 1e-6);
+	float mappedLuminance = SampleCustomToneCurve(sourceLuminance);
+	return max(color * (mappedLuminance / sourceLuminance), 0.0);
+}
+
 // ============================================================================
 // Film Curve Selector — dispatches to the chosen tonemapping operator
 // ============================================================================
@@ -782,8 +884,16 @@ float3 ApplyFilmCurve(float3 color, float mode, float4 hableParams1, float4 habl
 	else if (mode < 3.5)
 		return ReinhardStandard(color, reinhardWP);                // 3 = Reinhard Standard
 	// 4 = Durand, 5 = Fattal — handled by bPreToneMapped path
-	else if (mode > 5.5)
+	else if (mode < 5.5)
+		return ReinhardStandard(color, reinhardWP);                // safe fallback for spatial modes
+	else if (mode < 6.5)
 		return AgXToneMap(color, AgXParams);                       // 6 = AgX
+	else if (mode < 7.5)
+		return ACESHillToneMap(color);                             // 7 = ACES Hill Fit
+	else if (mode < 8.5)
+		return ACESNarkowiczToneMap(color);                        // 8 = ACES Narkowicz Fit
+	else if (mode < 9.5)
+		return CustomLuminanceToneMap(color);                      // 9 = Custom Luminance Curve
 	else
 		return ReinhardStandard(color, reinhardWP);                // fallback
 }
@@ -935,7 +1045,8 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 							 HueShift1, HueShift2,
 							 SatAdj1,   SatAdj2,
 							 LumAdj1,   LumAdj2,
-							 HSLSmoothing);
+							 HSLSmoothing,
+							 HSLMode);
 		}
 
 		// --- 10. Vibrance ---
@@ -969,10 +1080,10 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 			// Preserve colour-grading intent: scale pre-TM luminance by the ratio of
 			// colour-graded HDR relative to original HDR  (chrominance transfer).
 			float gradeScale = max(dot(color, float3(0.2126f, 0.7152f, 0.0722f)), 1e-6f)
-			                 / max(dot(originalColor * OneOverPreExposure * GlobalExposure,
+			                 / max(dot(originalColor * OneOverPreExposure * autoExposure,
 			                           float3(0.2126f, 0.7152f, 0.0722f)), 1e-6f);
 			color = preTM * gradeScale;
-			color = saturate(color);
+			color = (bLinearHDROutput > 0.5) ? max(color, 0.0) : saturate(color);
 		}
 		else
 		{
@@ -982,19 +1093,29 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 		// --- 15. Parametric Tone Curve (fine-tuning, now in LDR 0-1) ---
 		if (bEnableCurves > 0.5)
 		{
-			color = ApplyToneCurve(color, ToneCurveParams);
+			color = (bLinearHDROutput > 0.5)
+				? ApplyToneCurveLinearHDR(color, ToneCurveParams)
+				: ApplyToneCurve(color, ToneCurveParams);
 		}
 
 		// --- 16. Linear → sRGB gamma conversion ---
-		color = saturate(color);
-		color = LinearToSRGB(color);
+		if (bLinearHDROutput > 0.5)
+		{
+			// True HDR output stays linear until the final PQ/scRGB encode pass.
+			color = max(color, 0.0);
+		}
+		else
+		{
+			// Paper-white HDR mode and SDR output use the original sRGB/LDR path.
+			color = saturate(color);
+			color = LinearToSRGB(color);
+		}
 
 		// --- 17. Dithering (last-pass only; quantum set by subsystem) ---
 		if (DitherQuantization > 0.0)
 			color = ApplyDithering(color, SvPosition.xy, DitherQuantization);
 
-		// Clamp final output
-		color = saturate(color);
+		color = (bLinearHDROutput > 0.5) ? max(color, 0.0) : saturate(color);
 	}
 	else
 	{
@@ -1058,7 +1179,8 @@ void ToneMapProcessPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_
 							 HueShift1, HueShift2,
 							 SatAdj1,   SatAdj2,
 							 LumAdj1,   LumAdj2,
-							 HSLSmoothing);
+							 HSLSmoothing,
+							 HSLMode);
 		}
 
 		// --- 7. Vibrance ---

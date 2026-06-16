@@ -3,10 +3,11 @@
 // ToneMapFX — Final HDR Output Encoding Pass
 //
 // Runs as the LAST pass in the ToneMapFX pipeline (after ToneMapProcess, LUT,
-// and Vignette).  Converts the sRGB-gamma output to the display's native HDR
-// encoding (ST2084/PQ for HDR10, scRGB linear for Windows HDR).
+// and Vignette). Converts either legacy sRGB paper-white output or linear
+// display-referred HDR output to the display's native HDR encoding
+// (ST2084/PQ for HDR10, scRGB linear for Windows HDR).
 //
-// Input:  sRGB display-referred color (same as SDR final output)
+// Input:  sRGB display-referred color, or linear HDR when bInputIsLinearHDR=1.
 // Output: Display-encoded HDR signal
 // ============================================================================
 
@@ -14,13 +15,14 @@
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/ScreenPass.ush"
 
-// Scene color input (sRGB-encoded output of previous pass)
+// Scene color input from the previous pass.
 Texture2D    SceneColorTexture;
 SamplerState SceneColorSampler;
 FScreenTransform SvPositionToSceneColorUV;
 
 // HDR parameters (set from C++ via GetTonemapperOutputDeviceParameters)
 float OutputDeviceType;  // EDisplayOutputFormat cast to float
+float bInputIsLinearHDR; // 0 = sRGB paper-white mode, 1 = linear HDR mode
 float PaperWhiteNits;    // User-configurable paper-white brightness (default 200)
 float MaxDisplayNits;    // Peak display luminance from OS/driver
 float DitherQuantization; // 0 = off, 1/1023 = 10-bit PQ, etc.
@@ -92,13 +94,16 @@ void HDREncodePS(
 	out float4 OutColor : SV_Target0)
 {
 	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
-	float3 srgb = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb;
+	float3 encodedInput = Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb;
 
 	// Step 1: Decode sRGB gamma → linear light [0,1]
-	float3 linearColor = SRGBToLinearFull(srgb);
+	float3 linearColor = (bInputIsLinearHDR > 0.5)
+		? max(encodedInput, 0.0)
+		: SRGBToLinearFull(saturate(encodedInput));
 
 	// Clamp paper-white to sane range
 	float paperWhite = clamp(PaperWhiteNits, 80.0, 500.0);
+	float peakNits = max(MaxDisplayNits, paperWhite);
 
 	if (OutputDeviceType > 2.5 && OutputDeviceType < 4.5)
 	{
@@ -109,6 +114,10 @@ void HDREncodePS(
 		// This makes the tone-mapped white point match the user's
 		// desired paper-white brightness.
 		float3 nits = linearColor * paperWhite;
+		if (bInputIsLinearHDR > 0.5)
+		{
+			nits = min(nits, peakNits);
+		}
 
 		// Convert BT.709 → BT.2020 wide gamut (required by ST2084 spec)
 		nits = mul(BT709_to_BT2020, nits);
@@ -138,6 +147,10 @@ void HDREncodePS(
 		// Map our linear [0,1] so that 1.0 (peak white) = paperWhite nits.
 		// paperWhite / 80 gives the scRGB multiplier.
 		float3 scrgb = linearColor * (paperWhite / SCRGB_WHITE_NITS);
+		if (bInputIsLinearHDR > 0.5)
+		{
+			scrgb = min(scrgb, peakNits / SCRGB_WHITE_NITS);
+		}
 
 		// scRGB: no clamp, no gamma — output linear float16
 		OutColor = float4(scrgb, 1.0);
@@ -150,7 +163,7 @@ void HDREncodePS(
 		// This path should not normally be reached (the HDR encode pass
 		// is only added when the display is HDR), but provides a safe
 		// identity fallback: output the sRGB input unchanged.
-		float3 sdrOut = srgb;
+		float3 sdrOut = saturate(encodedInput);
 		if (DitherQuantization > 0.0)
 		{
 			float n1 = IGNoise(SvPosition.xy);

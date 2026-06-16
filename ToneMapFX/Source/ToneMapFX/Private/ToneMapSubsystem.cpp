@@ -17,8 +17,808 @@
 #include "PostProcess/PostProcessMaterialInputs.h"
 #include "PostProcess/PostProcessTonemap.h"
 #include "ToneMapHDREncode.h"
+#include "HDRHelper.h"
+#include "RHIGlobals.h"
 #include "RenderGraphUtils.h"
 #include "PixelShaderUtils.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
+
+namespace
+{
+struct FToneMapWeightedComponent
+{
+	UToneMapComponent* Component = nullptr;
+	float RawWeight = 0.0f;
+	float NormalizedWeight = 0.0f;
+};
+
+struct FToneMapResolvedSettings
+{
+	EToneMapMode Mode = EToneMapMode::PostProcess;
+	EToneMapProcessingPath ProcessingPath = EToneMapProcessingPath::PerPixel;
+	EToneMapPostProcessPass PostProcessPass = EToneMapPostProcessPass::Tonemap;
+	EToneMapAutoExposure AutoExposureMode = EToneMapAutoExposure::EngineDefault;
+	EToneMapFilmCurve FilmCurve = EToneMapFilmCurve::Hable;
+	EToneMapHDROutputMode HDROutputMode = EToneMapHDROutputMode::PaperWhiteNits;
+	EToneMapSharpenMethod SharpenMethod = EToneMapSharpenMethod::LegacyUnsharpMask;
+	EAgXLook AgXLook = EAgXLook::None;
+	EToneMapColorBlendSpace ColorBlendSpace = EToneMapColorBlendSpace::LegacyLinearRGB;
+	EBloomMode BloomMode = EBloomMode::SoftFocus;
+	EBloomBlendMode BloomBlendMode = EBloomBlendMode::SoftLight;
+	EToneMapHaloPattern HaloPattern = EToneMapHaloPattern::StretchedLines;
+	EToneMapHSLMode HSLMode = EToneMapHSLMode::Smooth;
+	EVignetteMode VignetteMode = EVignetteMode::Circular;
+	EVignetteFalloff VignetteFalloff = EVignetteFalloff::Smooth;
+	EVignetteTextureChannel VignetteTextureChannel = EVignetteTextureChannel::Alpha;
+
+	bool bHDROutput = false;
+	bool bAutoDetectHDROutput = false;
+	bool bDebugHDRLogging = false;
+	bool bEnableWhiteBalance = true;
+	bool bEnableToneAdjustments = true;
+	bool bUseCameraExposure = false;
+	bool bEnableDithering = true;
+	bool bForceFP16Pipeline = true;
+	bool bEnableCiliaryCorona = false;
+	bool bEnableLenticularHalo = false;
+	bool bEnableBloom = false;
+	bool bUseSceneColor = true;
+	bool bProtectHighlights = false;
+	bool bKawaseSoftThreshold = true;
+	bool bEnableVignette = false;
+	bool bVignetteUseAlphaTexture = false;
+	bool bVignetteAlphaTextureOnly = false;
+	bool bEnableLUT = false;
+	bool bEnableSharpening = false;
+	bool bDisableUnrealBloom = true;
+	bool bDisableUnrealMotionBlur = false;
+
+	float PaperWhiteNits = 200.0f;
+	float Temperature = 0.0f;
+	float Tint = 0.0f;
+	float Exposure = 0.0f;
+	float Contrast = 0.0f;
+	float Highlights = 0.0f;
+	float Shadows = 0.0f;
+	float Whites = 0.0f;
+	float Blacks = 0.0f;
+	float ToneSmoothing = 100.0f;
+	float ContrastMidpoint = 0.18f;
+	float Clarity = 0.0f;
+	float ClarityRadius = 8.0f;
+	float Vibrance = 0.0f;
+	float Saturation = 0.0f;
+	float SharpenAmount = 25.0f;
+	float SharpenRadius = 1.0f;
+	float DynamicContrast = 0.0f;
+	float CorrectContrast = 0.0f;
+	float CorrectColorCast = 0.0f;
+	float CurveHighlights = 0.0f;
+	float CurveLights = 0.0f;
+	float CurveDarks = 0.0f;
+	float CurveShadows = 0.0f;
+	float HSLSmoothing = 100.0f;
+	float HueReds = 0.0f;
+	float HueOranges = 0.0f;
+	float HueYellows = 0.0f;
+	float HueGreens = 0.0f;
+	float HueAquas = 0.0f;
+	float HueBlues = 0.0f;
+	float HuePurples = 0.0f;
+	float HueMagentas = 0.0f;
+	float SatReds = 0.0f;
+	float SatOranges = 0.0f;
+	float SatYellows = 0.0f;
+	float SatGreens = 0.0f;
+	float SatAquas = 0.0f;
+	float SatBlues = 0.0f;
+	float SatPurples = 0.0f;
+	float SatMagentas = 0.0f;
+	float LumReds = 0.0f;
+	float LumOranges = 0.0f;
+	float LumYellows = 0.0f;
+	float LumGreens = 0.0f;
+	float LumAquas = 0.0f;
+	float LumBlues = 0.0f;
+	float LumPurples = 0.0f;
+	float LumMagentas = 0.0f;
+	float CameraISO = 100.0f;
+	float ShutterSpeedDenominator = 125.0f;
+	float Aperture = 5.6f;
+	float DitherQuantization = 1.0f / 255.0f;
+	float AdaptationSpeedUp = 3.0f;
+	float AdaptationSpeedDown = 1.0f;
+	float MinAutoExposure = 0.05f;
+	float MaxAutoExposure = 20.0f;
+	float HableShoulderStrength = 0.15f;
+	float HableLinearStrength = 0.50f;
+	float HableLinearAngle = 0.10f;
+	float HableToeStrength = 0.20f;
+	float HableToeNumerator = 0.02f;
+	float HableToeDenominator = 0.30f;
+	float HableWhitePoint = 11.2f;
+	float ReinhardWhitePoint = 100.0f;
+	float CustomCurveMinEV = -10.0f;
+	float CustomCurveMaxEV = 6.5f;
+	float HDRSaturation = 1.0f;
+	FLinearColor HDRColorBalance = FLinearColor::White;
+	float DurandSpatialSigma = 16.0f;
+	float DurandRangeSigma = 0.35f;
+	float DurandBaseCompression = 0.5f;
+	float DurandDetailBoost = 1.0f;
+	float FattalAlpha = 0.1f;
+	float FattalBeta = 0.9f;
+	float FattalSaturation = 0.8f;
+	float FattalNoise = 0.0001f;
+	int32 FattalJacobiIterations = 30;
+	float AgXMinEV = -10.0f;
+	float AgXMaxEV = 6.5f;
+	float CoronaIntensity = 0.5f;
+	int32 CoronaSpikeCount = 6;
+	int32 CoronaSpikeLength = 80;
+	float CoronaThreshold = 0.8f;
+	float HaloIntensity = 0.3f;
+	float HaloRadius = 0.15f;
+	float HaloThickness = 0.03f;
+	float HaloIrregularity = 0.45f;
+	float HaloArcStretch = 0.35f;
+	int32 HaloLineCount = 5;
+	float HaloLineThickness = 5.0f;
+	float HaloThreshold = 0.9f;
+	FLinearColor HaloTint = FLinearColor(0.85f, 0.90f, 1.0f, 1.0f);
+	float BloomIntensity = 1.0f;
+	float BloomThreshold = 0.8f;
+	float BloomThresholdSoftness = 0.5f;
+	float BloomMaxBrightness = 0.0f;
+	float BloomSize = 16.0f;
+	EBloomColorMode BloomColorMode = EBloomColorMode::SceneColor;
+	FLinearColor BloomTint = FLinearColor::White;
+	float BloomBlendStrength = 1.0f;
+	float BloomSaturation = 1.0f;
+	float HighlightProtection = 0.5f;
+	float DownsampleScale = 1.0f;
+	int32 BlurPasses = 1;
+	int32 GlareStreakCount = 6;
+	int32 GlareStreakLength = 40;
+	float GlareRotationOffset = 0.0f;
+	float GlareFalloff = 3.0f;
+	int32 GlareSamples = 16;
+	int32 KawaseMipCount = 5;
+	float KawaseFilterRadius = 0.002f;
+	float KawaseThresholdKnee = 0.5f;
+	float SoftFocusOverlayMultiplier = 0.5f;
+	float SoftFocusBlendStrength = 0.33f;
+	float SoftFocusSoftLightMultiplier = 0.4f;
+	float SoftFocusFinalBlend = 0.25f;
+	float VignetteSize = 30.0f;
+	float VignetteIntensity = 50.0f;
+	float VignetteFalloffExponent = 2.0f;
+	float LUTIntensity = 1.0f;
+	UTexture* CustomToneCurveTexture = nullptr;
+	UTexture* LUTTexture = nullptr;
+	UTexture* VignetteAlphaTexture = nullptr;
+
+	bool IsAnyHSLActive() const
+	{
+		const float Eps = 0.01f;
+		return FMath::Abs(HueReds) > Eps || FMath::Abs(HueOranges) > Eps ||
+			FMath::Abs(HueYellows) > Eps || FMath::Abs(HueGreens) > Eps ||
+			FMath::Abs(HueAquas) > Eps || FMath::Abs(HueBlues) > Eps ||
+			FMath::Abs(HuePurples) > Eps || FMath::Abs(HueMagentas) > Eps ||
+			FMath::Abs(SatReds) > Eps || FMath::Abs(SatOranges) > Eps ||
+			FMath::Abs(SatYellows) > Eps || FMath::Abs(SatGreens) > Eps ||
+			FMath::Abs(SatAquas) > Eps || FMath::Abs(SatBlues) > Eps ||
+			FMath::Abs(SatPurples) > Eps || FMath::Abs(SatMagentas) > Eps ||
+			FMath::Abs(LumReds) > Eps || FMath::Abs(LumOranges) > Eps ||
+			FMath::Abs(LumYellows) > Eps || FMath::Abs(LumGreens) > Eps ||
+			FMath::Abs(LumAquas) > Eps || FMath::Abs(LumBlues) > Eps ||
+			FMath::Abs(LumPurples) > Eps || FMath::Abs(LumMagentas) > Eps;
+	}
+
+	bool IsAnyCurveActive() const
+	{
+		const float Eps = 0.01f;
+		return FMath::Abs(CurveHighlights) > Eps || FMath::Abs(CurveLights) > Eps ||
+			FMath::Abs(CurveDarks) > Eps || FMath::Abs(CurveShadows) > Eps;
+	}
+};
+
+static const TCHAR* GetBoolText(const bool bValue)
+{
+	return bValue ? TEXT("true") : TEXT("false");
+}
+
+static const TCHAR* GetHDROutputModeText(const EToneMapHDROutputMode Mode)
+{
+	switch (Mode)
+	{
+	case EToneMapHDROutputMode::PaperWhiteNits:
+		return TEXT("PaperWhiteNits");
+	case EToneMapHDROutputMode::TrueHDR:
+		return TEXT("TrueHDR");
+	default:
+		return TEXT("Unknown");
+	}
+}
+
+static void CopyToneMapSettings(const UToneMapComponent& Component, FToneMapResolvedSettings& Out)
+{
+#define COPY_FIELD(FieldName) Out.FieldName = Component.FieldName
+	COPY_FIELD(Mode);
+	COPY_FIELD(ProcessingPath);
+	COPY_FIELD(PostProcessPass);
+	COPY_FIELD(AutoExposureMode);
+	COPY_FIELD(FilmCurve);
+	COPY_FIELD(HDROutputMode);
+	COPY_FIELD(SharpenMethod);
+	COPY_FIELD(AgXLook);
+	COPY_FIELD(ColorBlendSpace);
+	COPY_FIELD(BloomMode);
+	COPY_FIELD(BloomBlendMode);
+	COPY_FIELD(HaloPattern);
+	COPY_FIELD(HSLMode);
+	COPY_FIELD(VignetteMode);
+	COPY_FIELD(VignetteFalloff);
+	COPY_FIELD(VignetteTextureChannel);
+	COPY_FIELD(bHDROutput);
+	COPY_FIELD(bAutoDetectHDROutput);
+	COPY_FIELD(bDebugHDRLogging);
+	COPY_FIELD(bEnableWhiteBalance);
+	COPY_FIELD(bEnableToneAdjustments);
+	COPY_FIELD(bUseCameraExposure);
+	COPY_FIELD(bEnableDithering);
+	COPY_FIELD(bForceFP16Pipeline);
+	COPY_FIELD(bEnableCiliaryCorona);
+	COPY_FIELD(bEnableLenticularHalo);
+	COPY_FIELD(bEnableBloom);
+	COPY_FIELD(bUseSceneColor);
+	COPY_FIELD(bProtectHighlights);
+	COPY_FIELD(bKawaseSoftThreshold);
+	COPY_FIELD(bEnableVignette);
+	COPY_FIELD(bVignetteUseAlphaTexture);
+	COPY_FIELD(bVignetteAlphaTextureOnly);
+	COPY_FIELD(bEnableLUT);
+	COPY_FIELD(bEnableSharpening);
+	COPY_FIELD(bDisableUnrealBloom);
+	COPY_FIELD(bDisableUnrealMotionBlur);
+	COPY_FIELD(PaperWhiteNits);
+	COPY_FIELD(Temperature);
+	COPY_FIELD(Tint);
+	COPY_FIELD(Exposure);
+	COPY_FIELD(Contrast);
+	COPY_FIELD(Highlights);
+	COPY_FIELD(Shadows);
+	COPY_FIELD(Whites);
+	COPY_FIELD(Blacks);
+	COPY_FIELD(ToneSmoothing);
+	COPY_FIELD(ContrastMidpoint);
+	COPY_FIELD(Clarity);
+	COPY_FIELD(ClarityRadius);
+	COPY_FIELD(Vibrance);
+	COPY_FIELD(Saturation);
+	COPY_FIELD(SharpenAmount);
+	COPY_FIELD(SharpenRadius);
+	COPY_FIELD(DynamicContrast);
+	COPY_FIELD(CorrectContrast);
+	COPY_FIELD(CorrectColorCast);
+	COPY_FIELD(CurveHighlights);
+	COPY_FIELD(CurveLights);
+	COPY_FIELD(CurveDarks);
+	COPY_FIELD(CurveShadows);
+	COPY_FIELD(HSLSmoothing);
+	COPY_FIELD(HueReds);
+	COPY_FIELD(HueOranges);
+	COPY_FIELD(HueYellows);
+	COPY_FIELD(HueGreens);
+	COPY_FIELD(HueAquas);
+	COPY_FIELD(HueBlues);
+	COPY_FIELD(HuePurples);
+	COPY_FIELD(HueMagentas);
+	COPY_FIELD(SatReds);
+	COPY_FIELD(SatOranges);
+	COPY_FIELD(SatYellows);
+	COPY_FIELD(SatGreens);
+	COPY_FIELD(SatAquas);
+	COPY_FIELD(SatBlues);
+	COPY_FIELD(SatPurples);
+	COPY_FIELD(SatMagentas);
+	COPY_FIELD(LumReds);
+	COPY_FIELD(LumOranges);
+	COPY_FIELD(LumYellows);
+	COPY_FIELD(LumGreens);
+	COPY_FIELD(LumAquas);
+	COPY_FIELD(LumBlues);
+	COPY_FIELD(LumPurples);
+	COPY_FIELD(LumMagentas);
+	COPY_FIELD(CameraISO);
+	COPY_FIELD(ShutterSpeedDenominator);
+	COPY_FIELD(Aperture);
+	COPY_FIELD(DitherQuantization);
+	COPY_FIELD(AdaptationSpeedUp);
+	COPY_FIELD(AdaptationSpeedDown);
+	COPY_FIELD(MinAutoExposure);
+	COPY_FIELD(MaxAutoExposure);
+	COPY_FIELD(HableShoulderStrength);
+	COPY_FIELD(HableLinearStrength);
+	COPY_FIELD(HableLinearAngle);
+	COPY_FIELD(HableToeStrength);
+	COPY_FIELD(HableToeNumerator);
+	COPY_FIELD(HableToeDenominator);
+	COPY_FIELD(HableWhitePoint);
+	COPY_FIELD(ReinhardWhitePoint);
+	COPY_FIELD(CustomCurveMinEV);
+	COPY_FIELD(CustomCurveMaxEV);
+	COPY_FIELD(HDRSaturation);
+	COPY_FIELD(HDRColorBalance);
+	COPY_FIELD(DurandSpatialSigma);
+	COPY_FIELD(DurandRangeSigma);
+	COPY_FIELD(DurandBaseCompression);
+	COPY_FIELD(DurandDetailBoost);
+	COPY_FIELD(FattalAlpha);
+	COPY_FIELD(FattalBeta);
+	COPY_FIELD(FattalSaturation);
+	COPY_FIELD(FattalNoise);
+	COPY_FIELD(FattalJacobiIterations);
+	COPY_FIELD(AgXMinEV);
+	COPY_FIELD(AgXMaxEV);
+	COPY_FIELD(CoronaIntensity);
+	COPY_FIELD(CoronaSpikeCount);
+	COPY_FIELD(CoronaSpikeLength);
+	COPY_FIELD(CoronaThreshold);
+	COPY_FIELD(HaloIntensity);
+	COPY_FIELD(HaloRadius);
+	COPY_FIELD(HaloThickness);
+	COPY_FIELD(HaloIrregularity);
+	COPY_FIELD(HaloArcStretch);
+	COPY_FIELD(HaloLineCount);
+	COPY_FIELD(HaloLineThickness);
+	COPY_FIELD(HaloThreshold);
+	COPY_FIELD(HaloTint);
+	COPY_FIELD(BloomIntensity);
+	COPY_FIELD(BloomThreshold);
+	COPY_FIELD(BloomThresholdSoftness);
+	COPY_FIELD(BloomMaxBrightness);
+	COPY_FIELD(BloomSize);
+	COPY_FIELD(BloomColorMode);
+	COPY_FIELD(BloomTint);
+	COPY_FIELD(BloomBlendStrength);
+	COPY_FIELD(BloomSaturation);
+	COPY_FIELD(HighlightProtection);
+	COPY_FIELD(DownsampleScale);
+	COPY_FIELD(BlurPasses);
+	COPY_FIELD(GlareStreakCount);
+	COPY_FIELD(GlareStreakLength);
+	COPY_FIELD(GlareRotationOffset);
+	COPY_FIELD(GlareFalloff);
+	COPY_FIELD(GlareSamples);
+	COPY_FIELD(KawaseMipCount);
+	COPY_FIELD(KawaseFilterRadius);
+	COPY_FIELD(KawaseThresholdKnee);
+	COPY_FIELD(SoftFocusOverlayMultiplier);
+	COPY_FIELD(SoftFocusBlendStrength);
+	COPY_FIELD(SoftFocusSoftLightMultiplier);
+	COPY_FIELD(SoftFocusFinalBlend);
+	COPY_FIELD(VignetteSize);
+	COPY_FIELD(VignetteIntensity);
+	COPY_FIELD(VignetteFalloffExponent);
+	COPY_FIELD(LUTIntensity);
+#undef COPY_FIELD
+	Out.CustomToneCurveTexture = Component.GetCustomToneCurveTexture();
+	Out.LUTTexture = Component.LUTTexture.Get();
+	Out.VignetteAlphaTexture = Component.VignetteAlphaTexture.Get();
+
+	if (!Component.bUseSceneColor && Out.BloomColorMode == EBloomColorMode::SceneColor)
+	{
+		Out.BloomColorMode = EBloomColorMode::Tint;
+	}
+}
+
+static FRHITexture* GetTextureRHI(UTexture* Texture)
+{
+	if (!Texture || !Texture->GetResource())
+	{
+		return nullptr;
+	}
+
+	return Texture->GetResource()->TextureRHI;
+}
+
+static FRDGTextureRef RegisterExternalTextureOrFallback(
+	FRDGBuilder& GraphBuilder,
+	UTexture* Texture,
+	FRDGTextureRef FallbackTexture,
+	const TCHAR* DebugName)
+{
+	if (FRHITexture* TextureRHI = GetTextureRHI(Texture))
+	{
+		return GraphBuilder.RegisterExternalTexture(CreateRenderTarget(TextureRHI, DebugName));
+	}
+
+	return FallbackTexture;
+}
+
+static float GetShaderFilmCurveMode(const FToneMapResolvedSettings& Settings)
+{
+	if (Settings.FilmCurve == EToneMapFilmCurve::CustomLuminanceCurve && !GetTextureRHI(Settings.CustomToneCurveTexture))
+	{
+		return (float)static_cast<uint8>(EToneMapFilmCurve::ReinhardStandard);
+	}
+
+	return (float)static_cast<uint8>(Settings.FilmCurve);
+}
+
+template <typename GetterType>
+static float BlendFloat(float DefaultValue, const TArray<FToneMapWeightedComponent>& Candidates, float TotalWeight, GetterType Getter)
+{
+	float WeightedValue = 0.0f;
+	for (const FToneMapWeightedComponent& Candidate : Candidates)
+	{
+		WeightedValue += Getter(Candidate.Component) * Candidate.NormalizedWeight;
+	}
+	return FMath::Lerp(DefaultValue, WeightedValue, TotalWeight);
+}
+
+struct FOklabColor
+{
+	float L = 0.0f;
+	float A = 0.0f;
+	float B = 0.0f;
+	float Alpha = 1.0f;
+};
+
+static float SignedCubeRoot(float Value)
+{
+	return Value >= 0.0f
+		? FMath::Pow(Value, 1.0f / 3.0f)
+		: -FMath::Pow(-Value, 1.0f / 3.0f);
+}
+
+static FOklabColor LinearSRGBToOklab(const FLinearColor& Color)
+{
+	const float L = 0.4122214708f * Color.R + 0.5363325363f * Color.G + 0.0514459929f * Color.B;
+	const float M = 0.2119034982f * Color.R + 0.6806995451f * Color.G + 0.1073969566f * Color.B;
+	const float S = 0.0883024619f * Color.R + 0.2817188376f * Color.G + 0.6299787005f * Color.B;
+
+	const float LPrime = SignedCubeRoot(L);
+	const float MPrime = SignedCubeRoot(M);
+	const float SPrime = SignedCubeRoot(S);
+
+	FOklabColor Result;
+	Result.L = 0.2104542553f * LPrime + 0.7936177850f * MPrime - 0.0040720468f * SPrime;
+	Result.A = 1.9779984951f * LPrime - 2.4285922050f * MPrime + 0.4505937099f * SPrime;
+	Result.B = 0.0259040371f * LPrime + 0.7827717662f * MPrime - 0.8086757660f * SPrime;
+	Result.Alpha = Color.A;
+	return Result;
+}
+
+static FLinearColor OklabToLinearSRGB(const FOklabColor& Color)
+{
+	const float LPrime = Color.L + 0.3963377774f * Color.A + 0.2158037573f * Color.B;
+	const float MPrime = Color.L - 0.1055613458f * Color.A - 0.0638541728f * Color.B;
+	const float SPrime = Color.L - 0.0894841775f * Color.A - 1.2914855480f * Color.B;
+
+	const float L = LPrime * LPrime * LPrime;
+	const float M = MPrime * MPrime * MPrime;
+	const float S = SPrime * SPrime * SPrime;
+
+	return FLinearColor(
+		FMath::Max(4.0767416621f * L - 3.3077115913f * M + 0.2309699292f * S, 0.0f),
+		FMath::Max(-1.2684380046f * L + 2.6097574011f * M - 0.3413193965f * S, 0.0f),
+		FMath::Max(-0.0041960863f * L - 0.7034186147f * M + 1.7076147010f * S, 0.0f),
+		Color.Alpha);
+}
+
+template <typename GetterType>
+static FLinearColor BlendColor(const FLinearColor& DefaultValue, const TArray<FToneMapWeightedComponent>& Candidates, float TotalWeight, EToneMapColorBlendSpace ColorBlendSpace, GetterType Getter)
+{
+	if (ColorBlendSpace == EToneMapColorBlendSpace::LegacyLinearRGB)
+	{
+		FLinearColor WeightedValue = FLinearColor::Transparent;
+		for (const FToneMapWeightedComponent& Candidate : Candidates)
+		{
+			const FLinearColor Value = Getter(Candidate.Component);
+			WeightedValue.R += Value.R * Candidate.NormalizedWeight;
+			WeightedValue.G += Value.G * Candidate.NormalizedWeight;
+			WeightedValue.B += Value.B * Candidate.NormalizedWeight;
+			WeightedValue.A += Value.A * Candidate.NormalizedWeight;
+		}
+
+		return FLinearColor(
+			FMath::Lerp(DefaultValue.R, WeightedValue.R, TotalWeight),
+			FMath::Lerp(DefaultValue.G, WeightedValue.G, TotalWeight),
+			FMath::Lerp(DefaultValue.B, WeightedValue.B, TotalWeight),
+			FMath::Lerp(DefaultValue.A, WeightedValue.A, TotalWeight));
+	}
+
+	FOklabColor WeightedValue;
+	WeightedValue.Alpha = 0.0f;
+	for (const FToneMapWeightedComponent& Candidate : Candidates)
+	{
+		const FOklabColor Value = LinearSRGBToOklab(Getter(Candidate.Component));
+		WeightedValue.L += Value.L * Candidate.NormalizedWeight;
+		WeightedValue.A += Value.A * Candidate.NormalizedWeight;
+		WeightedValue.B += Value.B * Candidate.NormalizedWeight;
+		WeightedValue.Alpha += Value.Alpha * Candidate.NormalizedWeight;
+	}
+
+	const FOklabColor DefaultOklab = LinearSRGBToOklab(DefaultValue);
+	FOklabColor BlendedValue;
+	BlendedValue.L = FMath::Lerp(DefaultOklab.L, WeightedValue.L, TotalWeight);
+	BlendedValue.A = FMath::Lerp(DefaultOklab.A, WeightedValue.A, TotalWeight);
+	BlendedValue.B = FMath::Lerp(DefaultOklab.B, WeightedValue.B, TotalWeight);
+	BlendedValue.Alpha = FMath::Lerp(DefaultOklab.Alpha, WeightedValue.Alpha, TotalWeight);
+	return OklabToLinearSRGB(BlendedValue);
+}
+
+template <typename PredicateType>
+static const UToneMapComponent* FindDominantComponentForFeature(const TArray<FToneMapWeightedComponent>& Candidates, PredicateType Predicate)
+{
+	const UToneMapComponent* DominantComponent = nullptr;
+	float DominantWeight = 0.0f;
+
+	for (const FToneMapWeightedComponent& Candidate : Candidates)
+	{
+		const UToneMapComponent* Component = Candidate.Component;
+		if (!Component || !Predicate(Component))
+		{
+			continue;
+		}
+
+		const bool bTakesDominance =
+			!DominantComponent ||
+			Component->BlendPriority > DominantComponent->BlendPriority ||
+			(Component->BlendPriority == DominantComponent->BlendPriority && Candidate.RawWeight > DominantWeight);
+
+		if (bTakesDominance)
+		{
+			DominantComponent = Component;
+			DominantWeight = Candidate.RawWeight;
+		}
+	}
+
+	return DominantComponent;
+}
+
+static bool ResolveToneMapSettings(
+	const TArray<TWeakObjectPtr<UToneMapComponent>>& Components,
+	const FVector& ViewLocation,
+	FToneMapResolvedSettings& OutSettings,
+	UToneMapComponent*& OutDominantComponent)
+{
+	TArray<FToneMapWeightedComponent> Candidates;
+	float RawWeightSum = 0.0f;
+	UToneMapComponent* DominantComponent = nullptr;
+	float DominantWeight = 0.0f;
+
+	for (const TWeakObjectPtr<UToneMapComponent>& Ptr : Components)
+	{
+		UToneMapComponent* Component = Ptr.Get();
+		if (!Component || !Component->IsActive() || !Component->bEnabled)
+		{
+			continue;
+		}
+
+		const float Weight = Component->GetBlendWeightAtLocation(ViewLocation);
+		if (Weight <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		FToneMapWeightedComponent& Candidate = Candidates.AddDefaulted_GetRef();
+		Candidate.Component = Component;
+		Candidate.RawWeight = Weight;
+		RawWeightSum += Weight;
+
+		const bool bTakesDominance =
+			!DominantComponent ||
+			Component->BlendPriority > DominantComponent->BlendPriority ||
+			(Component->BlendPriority == DominantComponent->BlendPriority && Weight > DominantWeight);
+
+		if (bTakesDominance)
+		{
+			DominantComponent = Component;
+			DominantWeight = Weight;
+		}
+	}
+
+	if (!DominantComponent || RawWeightSum <= KINDA_SMALL_NUMBER)
+	{
+		OutDominantComponent = nullptr;
+		return false;
+	}
+
+	for (FToneMapWeightedComponent& Candidate : Candidates)
+	{
+		Candidate.NormalizedWeight = Candidate.RawWeight / RawWeightSum;
+	}
+
+	const float TotalWeight = FMath::Clamp(RawWeightSum, 0.0f, 1.0f);
+	const UToneMapComponent* Defaults = GetDefault<UToneMapComponent>();
+
+	CopyToneMapSettings(*DominantComponent, OutSettings);
+
+#define BLEND_FIELD(FieldName) OutSettings.FieldName = BlendFloat(Defaults->FieldName, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->FieldName; })
+#define BLEND_EFFECT_FIELD(FieldName, DefaultValue, EnableField) OutSettings.FieldName = BlendFloat(DefaultValue, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->EnableField ? Component->FieldName : 0.0f; })
+#define BLEND_COLOR_FIELD(FieldName) OutSettings.FieldName = BlendColor(Defaults->FieldName, Candidates, TotalWeight, OutSettings.ColorBlendSpace, [](const UToneMapComponent* Component) { return Component->FieldName; })
+
+	OutSettings.Temperature = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->bEnableWhiteBalance ? Component->Temperature : 0.0f; });
+	OutSettings.Tint        = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->bEnableWhiteBalance ? Component->Tint : 0.0f; });
+	BLEND_FIELD(Exposure);
+	BLEND_FIELD(Contrast);
+	OutSettings.Highlights = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->bEnableToneAdjustments ? Component->Highlights : 0.0f; });
+	OutSettings.Shadows    = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->bEnableToneAdjustments ? Component->Shadows : 0.0f; });
+	OutSettings.Whites     = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->bEnableToneAdjustments ? Component->Whites : 0.0f; });
+	OutSettings.Blacks     = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return Component->bEnableToneAdjustments ? Component->Blacks : 0.0f; });
+	BLEND_FIELD(ToneSmoothing);
+	BLEND_FIELD(ContrastMidpoint);
+	BLEND_FIELD(Clarity);
+	BLEND_FIELD(ClarityRadius);
+	BLEND_FIELD(Vibrance);
+	BLEND_FIELD(Saturation);
+	BLEND_EFFECT_FIELD(SharpenAmount, 0.0f, bEnableSharpening);
+	BLEND_FIELD(SharpenRadius);
+	BLEND_FIELD(DynamicContrast);
+	BLEND_FIELD(CorrectContrast);
+	BLEND_FIELD(CorrectColorCast);
+	BLEND_FIELD(CurveHighlights);
+	BLEND_FIELD(CurveLights);
+	BLEND_FIELD(CurveDarks);
+	BLEND_FIELD(CurveShadows);
+	BLEND_FIELD(HSLSmoothing);
+	BLEND_FIELD(HueReds);
+	BLEND_FIELD(HueOranges);
+	BLEND_FIELD(HueYellows);
+	BLEND_FIELD(HueGreens);
+	BLEND_FIELD(HueAquas);
+	BLEND_FIELD(HueBlues);
+	BLEND_FIELD(HuePurples);
+	BLEND_FIELD(HueMagentas);
+	BLEND_FIELD(SatReds);
+	BLEND_FIELD(SatOranges);
+	BLEND_FIELD(SatYellows);
+	BLEND_FIELD(SatGreens);
+	BLEND_FIELD(SatAquas);
+	BLEND_FIELD(SatBlues);
+	BLEND_FIELD(SatPurples);
+	BLEND_FIELD(SatMagentas);
+	BLEND_FIELD(LumReds);
+	BLEND_FIELD(LumOranges);
+	BLEND_FIELD(LumYellows);
+	BLEND_FIELD(LumGreens);
+	BLEND_FIELD(LumAquas);
+	BLEND_FIELD(LumBlues);
+	BLEND_FIELD(LumPurples);
+	BLEND_FIELD(LumMagentas);
+	BLEND_FIELD(PaperWhiteNits);
+	BLEND_FIELD(DitherQuantization);
+	BLEND_FIELD(AdaptationSpeedUp);
+	BLEND_FIELD(AdaptationSpeedDown);
+	BLEND_FIELD(MinAutoExposure);
+	BLEND_FIELD(MaxAutoExposure);
+	BLEND_FIELD(HableShoulderStrength);
+	BLEND_FIELD(HableLinearStrength);
+	BLEND_FIELD(HableLinearAngle);
+	BLEND_FIELD(HableToeStrength);
+	BLEND_FIELD(HableToeNumerator);
+	BLEND_FIELD(HableToeDenominator);
+	BLEND_FIELD(HableWhitePoint);
+	BLEND_FIELD(ReinhardWhitePoint);
+	BLEND_FIELD(HDRSaturation);
+	BLEND_COLOR_FIELD(HDRColorBalance);
+	BLEND_FIELD(DurandSpatialSigma);
+	BLEND_FIELD(DurandRangeSigma);
+	BLEND_FIELD(DurandBaseCompression);
+	BLEND_FIELD(DurandDetailBoost);
+	BLEND_FIELD(FattalAlpha);
+	BLEND_FIELD(FattalBeta);
+	BLEND_FIELD(FattalSaturation);
+	BLEND_FIELD(FattalNoise);
+	BLEND_FIELD(AgXMinEV);
+	BLEND_FIELD(AgXMaxEV);
+	BLEND_EFFECT_FIELD(CoronaIntensity, 0.0f, bEnableCiliaryCorona);
+	BLEND_FIELD(CoronaThreshold);
+	BLEND_EFFECT_FIELD(HaloIntensity, 0.0f, bEnableLenticularHalo);
+	BLEND_FIELD(HaloRadius);
+	BLEND_FIELD(HaloThickness);
+	BLEND_FIELD(HaloIrregularity);
+	BLEND_FIELD(HaloArcStretch);
+	BLEND_FIELD(HaloLineThickness);
+	BLEND_FIELD(HaloThreshold);
+	OutSettings.HaloTint = BlendColor(Defaults->HaloTint, Candidates, TotalWeight, OutSettings.ColorBlendSpace, [Defaults](const UToneMapComponent* Component) { return Component->bEnableLenticularHalo ? Component->HaloTint : Defaults->HaloTint; });
+	BLEND_EFFECT_FIELD(BloomIntensity, 0.0f, bEnableBloom);
+	BLEND_FIELD(BloomThreshold);
+	BLEND_FIELD(BloomThresholdSoftness);
+	BLEND_FIELD(BloomMaxBrightness);
+	BLEND_FIELD(BloomSize);
+	OutSettings.BloomTint = BlendColor(Defaults->BloomTint, Candidates, TotalWeight, OutSettings.ColorBlendSpace, [Defaults](const UToneMapComponent* Component) { return Component->bEnableBloom ? Component->BloomTint : Defaults->BloomTint; });
+	OutSettings.BloomBlendStrength = BlendFloat(Defaults->BloomBlendStrength, Candidates, TotalWeight, [Defaults](const UToneMapComponent* Component) { return Component->bEnableBloom ? Component->BloomBlendStrength : Defaults->BloomBlendStrength; });
+	BLEND_FIELD(BloomSaturation);
+	BLEND_FIELD(HighlightProtection);
+	BLEND_FIELD(DownsampleScale);
+	BLEND_FIELD(GlareRotationOffset);
+	BLEND_FIELD(GlareFalloff);
+	BLEND_FIELD(KawaseFilterRadius);
+	BLEND_FIELD(KawaseThresholdKnee);
+	BLEND_FIELD(SoftFocusOverlayMultiplier);
+	BLEND_FIELD(SoftFocusBlendStrength);
+	BLEND_FIELD(SoftFocusSoftLightMultiplier);
+	BLEND_FIELD(SoftFocusFinalBlend);
+	BLEND_FIELD(VignetteSize);
+	BLEND_EFFECT_FIELD(VignetteIntensity, 0.0f, bEnableVignette);
+	BLEND_FIELD(VignetteFalloffExponent);
+	OutSettings.LUTIntensity = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component) { return (Component->bEnableLUT && Component->LUTTexture != nullptr) ? Component->LUTIntensity : 0.0f; });
+
+	if (const UToneMapComponent* BloomOwner = FindDominantComponentForFeature(Candidates, [](const UToneMapComponent* Component) { return Component->bEnableBloom && Component->BloomIntensity > 0.01f; }))
+	{
+		OutSettings.BloomMode = BloomOwner->BloomMode;
+		OutSettings.BloomBlendMode = BloomOwner->BloomBlendMode;
+		OutSettings.BloomColorMode = BloomOwner->BloomColorMode;
+		OutSettings.bUseSceneColor = BloomOwner->bUseSceneColor;
+		OutSettings.bProtectHighlights = BloomOwner->bProtectHighlights;
+		OutSettings.bKawaseSoftThreshold = BloomOwner->bKawaseSoftThreshold;
+		OutSettings.BlurPasses = BloomOwner->BlurPasses;
+		OutSettings.GlareStreakCount = BloomOwner->GlareStreakCount;
+		OutSettings.GlareStreakLength = BloomOwner->GlareStreakLength;
+		OutSettings.GlareSamples = BloomOwner->GlareSamples;
+		OutSettings.KawaseMipCount = BloomOwner->KawaseMipCount;
+
+		if (!BloomOwner->bUseSceneColor && OutSettings.BloomColorMode == EBloomColorMode::SceneColor)
+		{
+			OutSettings.BloomColorMode = EBloomColorMode::Tint;
+		}
+	}
+
+	if (const UToneMapComponent* CoronaOwner = FindDominantComponentForFeature(Candidates, [](const UToneMapComponent* Component) { return Component->bEnableCiliaryCorona && Component->CoronaIntensity > 0.01f; }))
+	{
+		OutSettings.CoronaSpikeCount = CoronaOwner->CoronaSpikeCount;
+		OutSettings.CoronaSpikeLength = CoronaOwner->CoronaSpikeLength;
+	}
+
+	if (const UToneMapComponent* LUTOwner = FindDominantComponentForFeature(Candidates, [](const UToneMapComponent* Component) { return Component->bEnableLUT && Component->LUTTexture != nullptr && Component->LUTIntensity > 0.001f; }))
+	{
+		OutSettings.LUTTexture = LUTOwner->LUTTexture.Get();
+	}
+	else
+	{
+		OutSettings.LUTTexture = nullptr;
+	}
+
+	if (const UToneMapComponent* VignetteOwner = FindDominantComponentForFeature(Candidates, [](const UToneMapComponent* Component) { return Component->bEnableVignette && FMath::Abs(Component->VignetteIntensity) > 0.01f; }))
+	{
+		OutSettings.VignetteMode = VignetteOwner->VignetteMode;
+		OutSettings.VignetteFalloff = VignetteOwner->VignetteFalloff;
+		OutSettings.VignetteTextureChannel = VignetteOwner->VignetteTextureChannel;
+		OutSettings.bVignetteUseAlphaTexture = VignetteOwner->bVignetteUseAlphaTexture;
+		OutSettings.bVignetteAlphaTextureOnly = VignetteOwner->bVignetteAlphaTextureOnly;
+		OutSettings.VignetteAlphaTexture = VignetteOwner->VignetteAlphaTexture.Get();
+	}
+	else
+	{
+		OutSettings.VignetteAlphaTexture = nullptr;
+	}
+
+#undef BLEND_COLOR_FIELD
+#undef BLEND_EFFECT_FIELD
+#undef BLEND_FIELD
+
+	OutSettings.bEnableWhiteBalance = FMath::Abs(OutSettings.Temperature) > 0.01f || FMath::Abs(OutSettings.Tint) > 0.01f;
+	OutSettings.bEnableToneAdjustments =
+		FMath::Abs(OutSettings.Highlights) > 0.01f ||
+		FMath::Abs(OutSettings.Shadows) > 0.01f ||
+		FMath::Abs(OutSettings.Whites) > 0.01f ||
+		FMath::Abs(OutSettings.Blacks) > 0.01f;
+	OutSettings.bEnableSharpening = OutSettings.SharpenAmount > 0.01f;
+	OutSettings.bEnableCiliaryCorona = OutSettings.CoronaIntensity > 0.01f;
+	OutSettings.bEnableLenticularHalo = OutSettings.HaloIntensity > 0.0f;
+	OutSettings.bEnableBloom = OutSettings.BloomIntensity > 0.01f;
+	OutSettings.bEnableVignette = FMath::Abs(OutSettings.VignetteIntensity) > 0.01f;
+	OutSettings.bEnableLUT = OutSettings.LUTTexture != nullptr && OutSettings.LUTIntensity > 0.001f;
+
+	OutDominantComponent = DominantComponent;
+	return true;
+}
+} // namespace
 
 // =============================================================================
 // FToneMapSceneViewExtension
@@ -42,27 +842,98 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 	UToneMapSubsystem* Subsystem = WeakSubsystem.Get();
 	if (!Subsystem) return;
 
-	const TArray<TWeakObjectPtr<UToneMapComponent>>& Comps = Subsystem->GetComponents();
-	for (const TWeakObjectPtr<UToneMapComponent>& Ptr : Comps)
+	FToneMapResolvedSettings ResolvedSettings;
+	UToneMapComponent* DominantComponent = nullptr;
+	if (!ResolveToneMapSettings(Subsystem->GetComponents(), InView.ViewLocation, ResolvedSettings, DominantComponent))
 	{
-		if (Ptr.IsValid() && Ptr->IsActive() && Ptr->bEnabled)
-		{
-			bCachedReplaceTonemap = (Ptr->Mode == EToneMapMode::ReplaceTonemap);
-			bCachedHDROutput = Ptr->bHDROutput;
+		bCachedReplaceTonemap = false;
+		bCachedHDROutput = false;
+		LastHDRSetupDebugState.bValid = false;
+		return;
+	}
+	(void)DominantComponent;
 
-			// Auto-toggle r.HDR.EnableHDROutput to match the UI checkbox.
+	bCachedReplaceTonemap = (ResolvedSettings.Mode == EToneMapMode::ReplaceTonemap);
+	const bool bHDRRequested = bCachedReplaceTonemap && ResolvedSettings.bHDROutput;
+	const bool bHDRAllowed = IsHDRAllowed();
+	const bool bNoHDRCommandLine = FParse::Param(FCommandLine::Get(), TEXT("nohdr"));
+	const bool bHDRAutoDetectAvailable = GRHISupportsHDROutput && !bNoHDRCommandLine;
+	const bool bEffectiveHDROutput = ResolvedSettings.bAutoDetectHDROutput
+		? (bHDRRequested && bHDRAutoDetectAvailable)
+		: bHDRRequested;
+	bCachedHDROutput = bEffectiveHDROutput;
+
+	int32 HDRCVarValue = -1;
+			// Auto-toggle r.HDR.EnableHDROutput to match the effective HDR state.
 			// IConsoleManager is available through CoreMinimal.h — no extra includes.
 			{
 				static IConsoleVariable* CVarHDR = IConsoleManager::Get().FindConsoleVariable(TEXT("r.HDR.EnableHDROutput"));
 				if (CVarHDR)
 				{
-					const int32 DesiredValue = (bCachedReplaceTonemap && bCachedHDROutput) ? 1 : 0;
+					const int32 DesiredValue = bEffectiveHDROutput ? 1 : 0;
 					if (CVarHDR->GetInt() != DesiredValue)
 					{
 						CVarHDR->Set(DesiredValue, ECVF_SetByCode);
 					}
+					HDRCVarValue = CVarHDR->GetInt();
 				}
 			}
+
+	if (ResolvedSettings.bDebugHDRLogging)
+	{
+		const uint32 SetupOutputDevice = InViewFamily.RenderTarget
+			? static_cast<uint32>(InViewFamily.RenderTarget->GetDisplayOutputFormat())
+			: 0;
+		const float SetupOutputMaxNits = HDRGetDisplayMaximumLuminance();
+		const uint8 OutputMode = static_cast<uint8>(ResolvedSettings.HDROutputMode);
+		const bool bStateChanged =
+			!LastHDRSetupDebugState.bValid ||
+			LastHDRSetupDebugState.bRequested != bHDRRequested ||
+			LastHDRSetupDebugState.bEffective != bEffectiveHDROutput ||
+			LastHDRSetupDebugState.bAutoDetect != ResolvedSettings.bAutoDetectHDROutput ||
+			LastHDRSetupDebugState.bSupported != GRHISupportsHDROutput ||
+			LastHDRSetupDebugState.bAllowed != bHDRAllowed ||
+			LastHDRSetupDebugState.bNoHDRCommandLine != bNoHDRCommandLine ||
+			LastHDRSetupDebugState.CVarValue != HDRCVarValue ||
+			LastHDRSetupDebugState.OutputDevice != SetupOutputDevice ||
+			LastHDRSetupDebugState.OutputMode != OutputMode ||
+			!FMath::IsNearlyEqual(LastHDRSetupDebugState.OutputMaxLuminance, SetupOutputMaxNits, 0.5f) ||
+			!FMath::IsNearlyEqual(LastHDRSetupDebugState.PaperWhiteNits, ResolvedSettings.PaperWhiteNits, 0.5f);
+
+		if (bStateChanged)
+		{
+			UE_LOG(LogTemp, Log,
+				TEXT("ToneMapFX HDR setup: Requested=%s Effective=%s AutoDetect=%s RHIHDR=%s UEAllowed=%s NoHDRCmd=%s CVar=%d OutputDevice=%u OutputMaxNits=%.1f Mode=%s PaperWhiteNits=%.1f"),
+				GetBoolText(bHDRRequested),
+				GetBoolText(bEffectiveHDROutput),
+				GetBoolText(ResolvedSettings.bAutoDetectHDROutput),
+				GetBoolText(GRHISupportsHDROutput),
+				GetBoolText(bHDRAllowed),
+				GetBoolText(bNoHDRCommandLine),
+				HDRCVarValue,
+				SetupOutputDevice,
+				SetupOutputMaxNits,
+				GetHDROutputModeText(ResolvedSettings.HDROutputMode),
+				ResolvedSettings.PaperWhiteNits);
+
+			LastHDRSetupDebugState.bValid = true;
+			LastHDRSetupDebugState.bRequested = bHDRRequested;
+			LastHDRSetupDebugState.bEffective = bEffectiveHDROutput;
+			LastHDRSetupDebugState.bAutoDetect = ResolvedSettings.bAutoDetectHDROutput;
+			LastHDRSetupDebugState.bSupported = GRHISupportsHDROutput;
+			LastHDRSetupDebugState.bAllowed = bHDRAllowed;
+			LastHDRSetupDebugState.bNoHDRCommandLine = bNoHDRCommandLine;
+			LastHDRSetupDebugState.CVarValue = HDRCVarValue;
+			LastHDRSetupDebugState.OutputDevice = SetupOutputDevice;
+			LastHDRSetupDebugState.OutputMode = OutputMode;
+			LastHDRSetupDebugState.OutputMaxLuminance = SetupOutputMaxNits;
+			LastHDRSetupDebugState.PaperWhiteNits = ResolvedSettings.PaperWhiteNits;
+		}
+	}
+	else
+	{
+		LastHDRSetupDebugState.bValid = false;
+	}
 
 			// Auto-toggle r.PostProcessing.PropagateAlpha to force FP16 precision
 			// through the entire post-process chain (TAA/TSR, tonemapper output).
@@ -73,7 +944,7 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 				static IConsoleVariable* CVarPropAlpha = IConsoleManager::Get().FindConsoleVariable(TEXT("r.PostProcessing.PropagateAlpha"));
 				if (CVarPropAlpha)
 				{
-					const int32 DesiredValue = Ptr->bForceFP16Pipeline ? 1 : 0;
+					const int32 DesiredValue = ResolvedSettings.bForceFP16Pipeline ? 1 : 0;
 					if (CVarPropAlpha->GetInt() != DesiredValue)
 					{
 						CVarPropAlpha->Set(DesiredValue, ECVF_SetByCode);
@@ -99,22 +970,31 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 			}
 
 			// Disable UE's built-in bloom by zeroing its intensity
-			if (Ptr->bDisableUnrealBloom)
+			if (ResolvedSettings.bDisableUnrealBloom)
 			{
 				InView.FinalPostProcessSettings.bOverride_BloomIntensity = 1;
 				InView.FinalPostProcessSettings.BloomIntensity = 0.0f;
+			}
+
+			// Disable UE's built-in motion blur by zeroing the values checked by the renderer
+			if (ResolvedSettings.bDisableUnrealMotionBlur)
+			{
+				InView.FinalPostProcessSettings.bOverride_MotionBlurAmount = 1;
+				InView.FinalPostProcessSettings.MotionBlurAmount = 0.0f;
+				InView.FinalPostProcessSettings.bOverride_MotionBlurMax = 1;
+				InView.FinalPostProcessSettings.MotionBlurMax = 0.0f;
 			}
 
 			// Disable UE's built-in auto-exposure for Krawczyk and None modes.
 			// Engine Default intentionally keeps UE exposure active (user wants it).
 			//
 			// We neutralise every path that feeds into PreExposure:
-			//   AutoExposureMethod       → AEM_Manual   (no histogram/basic GPU pass)
-			//   AutoExposureBias         → 0            (pow(2, bias) scales PreExposure)
-			//   PhysicalCameraExposure   → false        (no ISO/aperture influence)
-			//   LocalExposure contrasts  → 1.0          (average feeds back into PreExposure)
+			//   AutoExposureMethod       -> AEM_Manual   (no histogram/basic GPU pass)
+			//   AutoExposureBias         -> 0            (pow(2, bias) scales PreExposure)
+			//   PhysicalCameraExposure   -> false        (no ISO/aperture influence)
+			//   LocalExposure settings   -> neutral      (average feeds back into PreExposure)
 			const bool bNeedNeutralExposure = bCachedReplaceTonemap &&
-				Ptr->AutoExposureMode != EToneMapAutoExposure::EngineDefault;
+				ResolvedSettings.AutoExposureMode != EToneMapAutoExposure::EngineDefault;
 
 			if (bNeedNeutralExposure)
 			{
@@ -132,11 +1012,13 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 				InView.FinalPostProcessSettings.LocalExposureHighlightContrastScale = 1.0f;
 				InView.FinalPostProcessSettings.bOverride_LocalExposureShadowContrastScale = 1;
 				InView.FinalPostProcessSettings.LocalExposureShadowContrastScale = 1.0f;
+				InView.FinalPostProcessSettings.bOverride_LocalExposureHighlightContrastCurve = 1;
+				InView.FinalPostProcessSettings.LocalExposureHighlightContrastCurve = nullptr;
+				InView.FinalPostProcessSettings.bOverride_LocalExposureShadowContrastCurve = 1;
+				InView.FinalPostProcessSettings.LocalExposureShadowContrastCurve = nullptr;
+				InView.FinalPostProcessSettings.bOverride_LocalExposureDetailStrength = 1;
+				InView.FinalPostProcessSettings.LocalExposureDetailStrength = 1.0f;
 			}
-
-			break;
-		}
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -167,40 +1049,35 @@ void FToneMapSceneViewExtension::SubscribeToPostProcessingPass(
 	UToneMapSubsystem* Subsystem = WeakSubsystem.Get();
 	if (!Subsystem) return;
 
-	// Determine desired pass from the first active ToneMap component
+	// Determine desired pass from the resolved ToneMap settings for this view.
 	EPostProcessingPass DesiredPass = EPostProcessingPass::Tonemap;
-	bool bFoundToneMap = false;
-	const TArray<TWeakObjectPtr<UToneMapComponent>>& Comps = Subsystem->GetComponents();
-	for (const TWeakObjectPtr<UToneMapComponent>& Ptr : Comps)
+	FToneMapResolvedSettings ResolvedSettings;
+	UToneMapComponent* DominantComponent = nullptr;
+	if (!ResolveToneMapSettings(Subsystem->GetComponents(), View.ViewLocation, ResolvedSettings, DominantComponent))
 	{
-		if (Ptr.IsValid() && Ptr->IsActive() && Ptr->bEnabled)
+		return;
+	}
+	(void)DominantComponent;
+
+	if (ResolvedSettings.Mode == EToneMapMode::ReplaceTonemap)
+	{
+		// Replace the entire tonemapper
+		DesiredPass = EPostProcessingPass::ReplacingTonemapper;
+	}
+	else
+	{
+		switch (ResolvedSettings.PostProcessPass)
 		{
-			bFoundToneMap = true;
-			if (Ptr->Mode == EToneMapMode::ReplaceTonemap)
-			{
-				// Replace the entire tonemapper
-				DesiredPass = EPostProcessingPass::ReplacingTonemapper;
-			}
-			else
-			{
-				switch (Ptr->PostProcessPass)
-				{
-				case EToneMapPostProcessPass::Tonemap:    DesiredPass = EPostProcessingPass::Tonemap;    break;
-				case EToneMapPostProcessPass::MotionBlur: DesiredPass = EPostProcessingPass::MotionBlur; break;
-				case EToneMapPostProcessPass::FXAA:                  DesiredPass = EPostProcessingPass::FXAA;                  break;
-				case EToneMapPostProcessPass::VisualizeDepthOfField: DesiredPass = EPostProcessingPass::VisualizeDepthOfField; break;
-				default:                                               DesiredPass = EPostProcessingPass::Tonemap;               break;
-				}
-			}
-			break;
+		case EToneMapPostProcessPass::Tonemap:    DesiredPass = EPostProcessingPass::Tonemap;    break;
+		case EToneMapPostProcessPass::MotionBlur: DesiredPass = EPostProcessingPass::MotionBlur; break;
+		case EToneMapPostProcessPass::FXAA:                  DesiredPass = EPostProcessingPass::FXAA;                  break;
+		case EToneMapPostProcessPass::VisualizeDepthOfField: DesiredPass = EPostProcessingPass::VisualizeDepthOfField; break;
+		default:                                               DesiredPass = EPostProcessingPass::Tonemap;               break;
 		}
 	}
 
-	if (!bFoundToneMap) return;
-
 	if (PassId == DesiredPass)
 	{
-		if (InOutPassCallbacks.Num() > 0) return; // prevent double-application in PIE
 		InOutPassCallbacks.Add(
 			FAfterPassCallbackDelegate::CreateRaw(
 				this, &FToneMapSceneViewExtension::PostProcessPass_RenderThread));
@@ -254,21 +1131,17 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	UToneMapSubsystem* Subsystem = WeakSubsystem.Get();
 	if (!Subsystem) return SceneColor;
 
-	// Find first active ToneMap component
-	UToneMapComponent* ActiveComp = nullptr;
-	for (const TWeakObjectPtr<UToneMapComponent>& Ptr : Subsystem->GetComponents())
+	FToneMapResolvedSettings ResolvedSettings;
+	UToneMapComponent* DominantComponent = nullptr;
+	if (!ResolveToneMapSettings(Subsystem->GetComponents(), View.ViewLocation, ResolvedSettings, DominantComponent))
 	{
-		if (Ptr.IsValid() && Ptr->IsActive() && Ptr->bEnabled)
-		{
-			ActiveComp = Ptr.Get();
-			break;
-		}
+		LastHDRRenderDebugState.bValid = false;
+		return SceneColor;
 	}
+	(void)DominantComponent;
 
-	// If nothing is active, return unchanged
-	if (!ActiveComp) return SceneColor;
-
-	const bool bIsReplaceTonemap = ActiveComp && (ActiveComp->Mode == EToneMapMode::ReplaceTonemap);
+	const FToneMapResolvedSettings* ActiveComp = &ResolvedSettings;
+	const bool bIsReplaceTonemap = (ActiveComp->Mode == EToneMapMode::ReplaceTonemap);
 
 	RDG_EVENT_SCOPE(GraphBuilder, "ToneMapFX");
 
@@ -309,7 +1182,8 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 					if (PixelShader.IsValid())
 					{
 						float EffectiveThreshold = ActiveComp->BloomThreshold;
-						bool bIsSoftFocusMode = (ActiveComp->BloomMode == EBloomMode::SoftFocus);
+						bool bIsSoftFocusMode = (ActiveComp->BloomMode == EBloomMode::SoftFocus ||
+							ActiveComp->BloomMode == EBloomMode::SoftFocusGlow);
 						if (bIsSoftFocusMode)
 						{
 							EffectiveThreshold = 0.01f;
@@ -343,7 +1217,9 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 				// Step 3: Blur — Gaussian, Directional Glare, or Kawase
 				FRDGTextureRef BlurredBloomTexture = nullptr;
-				bool bUseSoftFocus = (ActiveComp->BloomMode == EBloomMode::SoftFocus);
+				bool bUseSoftFocus = (ActiveComp->BloomMode == EBloomMode::SoftFocus ||
+					ActiveComp->BloomMode == EBloomMode::SoftFocusGlow);
+				bool bUseSoftFocusGlow = (ActiveComp->BloomMode == EBloomMode::SoftFocusGlow);
 
 				// --- Directional Glare ---
 				if (ActiveComp->BloomMode == EBloomMode::DirectionalGlare)
@@ -536,6 +1412,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 							DownParams->BloomThreshold = ActiveComp->BloomThreshold;
 							DownParams->ThresholdKnee = ThresholdKnee;
+							DownParams->MaxBrightness = FMath::Max(ActiveComp->BloomMaxBrightness, 0.0f);
 							DownParams->MipLevel = Mip;
 							DownParams->bUseKarisAverage = (Mip == 0) ? 1 : 0;
 							DownParams->RenderTargets[0] = FRenderTargetBinding(MipTextures[Mip], ERenderTargetLoadAction::EClear);
@@ -573,6 +1450,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 							UpParams->SourceSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 							UpParams->OutputSizeAndInvSize = FVector4f(MipExtents[Mip].X, MipExtents[Mip].Y, 1.0f / MipExtents[Mip].X, 1.0f / MipExtents[Mip].Y);
 							UpParams->FilterRadius = FilterRadius;
+							UpParams->MaxBrightness = FMath::Max(ActiveComp->BloomMaxBrightness, 0.0f);
 							UpParams->RenderTargets[0] = FRenderTargetBinding(UpsampleTextures[UpsampleIdx], ERenderTargetLoadAction::EClear);
 
 							FPixelShaderUtils::AddFullscreenPass(
@@ -596,6 +1474,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 							FinalUpParams->SourceSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 							FinalUpParams->OutputSizeAndInvSize = FVector4f(DownsampledExtent.X, DownsampledExtent.Y, 1.0f / DownsampledExtent.X, 1.0f / DownsampledExtent.Y);
 							FinalUpParams->FilterRadius = FilterRadius;
+							FinalUpParams->MaxBrightness = FMath::Max(ActiveComp->BloomMaxBrightness, 0.0f);
 							FinalUpParams->RenderTargets[0] = FRenderTargetBinding(BlurredBloomTexture, ERenderTargetLoadAction::EClear);
 
 							FPixelShaderUtils::AddFullscreenPass(
@@ -687,11 +1566,13 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 						CParams->BloomIntensity = bUseSoftFocus ? 0.0f : ActiveComp->BloomIntensity;
 
-						FLinearColor TintWithFlag = ActiveComp->BloomTint;
-						TintWithFlag.A = ActiveComp->bUseSceneColor ? 1.0f : 0.0f;
-						CParams->BloomTint = FVector4f(TintWithFlag);
+						CParams->BloomTint = FVector4f(ActiveComp->BloomTint);
 
-						CParams->BloomBlendMode = (float)ActiveComp->BloomBlendMode;
+						CParams->BloomColorMode = static_cast<float>(static_cast<uint8>(ActiveComp->BloomColorMode));
+						CParams->BloomBlendMode = (float)(bUseSoftFocusGlow
+							? EBloomBlendMode::SoftLightGlow
+							: ActiveComp->BloomBlendMode);
+						CParams->BloomBlendStrength = ActiveComp->BloomBlendStrength;
 						CParams->BloomSaturation = ActiveComp->BloomSaturation;
 						CParams->bProtectHighlights = ActiveComp->bProtectHighlights ? 1.0f : 0.0f;
 						CParams->HighlightProtection = ActiveComp->HighlightProtection;
@@ -1341,8 +2222,13 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 				Ph->BrightPassSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 				Ph->SvPositionToBrightPassUV = LensBrightPassUV;
 				Ph->BufferSizeAndInvSize = LensBufferSize;
+				Ph->HaloPattern = static_cast<float>(static_cast<uint8>(ActiveComp->HaloPattern));
 				Ph->HaloRadius    = ActiveComp->HaloRadius;
 				Ph->HaloThickness = ActiveComp->HaloThickness;
+				Ph->HaloIrregularity = ActiveComp->HaloIrregularity;
+				Ph->HaloArcStretch = ActiveComp->HaloArcStretch;
+				Ph->HaloLineCount = FMath::Clamp(ActiveComp->HaloLineCount, 1, 12);
+				Ph->HaloLineThickness = ActiveComp->HaloLineThickness;
 				Ph->HaloIntensity = ActiveComp->HaloIntensity;
 				Ph->HaloTint      = FVector3f(ActiveComp->HaloTint.R, ActiveComp->HaloTint.G, ActiveComp->HaloTint.B);
 				Ph->RenderTargets[0] = FRenderTargetBinding(HaloOut, ERenderTargetLoadAction::ENoAction);
@@ -1417,12 +2303,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 	// =====================================================================
 	// Post-pass chain: LUT → Vignette (each redirects through intermediates)
 	// =====================================================================
-	const bool bNeedLUT = ActiveComp->bEnableLUT
-		&& ActiveComp->LUTTexture != nullptr
-		&& ActiveComp->LUTTexture->GetResource() != nullptr
-		&& ActiveComp->LUTTexture->GetResource()->TextureRHI != nullptr
-		&& ActiveComp->LUTIntensity > 0.001f;
-
+	const bool bWantHDREncode = bIsReplaceTonemap && ActiveComp->bHDROutput && bCachedHDROutput;
 	const bool bNeedSharpening = ActiveComp->bEnableSharpening
 		&& ActiveComp->SharpenAmount > 0.01f;
 
@@ -1431,7 +2312,6 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 	// HDR output encoding as a final pass: requires ReplaceTonemap + HDR checkbox +
 	// an HDR-capable display (OutputDevice >= 3 in EDisplayOutputFormat).
-	const bool bWantHDREncode = bIsReplaceTonemap && ActiveComp->bHDROutput && bCachedHDROutput;
 	bool bNeedHDREncode = false;
 	uint32 HDROutputDevice = 0;
 	float  HDRMaxDisplayNits = 80.0f;
@@ -1442,6 +2322,54 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		HDRMaxDisplayNits = FMath::Max(OutDevParams.OutputMaxLuminance, 80.0f);
 		// Only add the HDR encode pass when the display is actually HDR (device >= 3)
 		bNeedHDREncode = (HDROutputDevice >= 3);
+	}
+	const bool bLinearHDROutput = bNeedHDREncode && ActiveComp->HDROutputMode == EToneMapHDROutputMode::TrueHDR;
+	const bool bNeedLUT = !bLinearHDROutput
+		&& ActiveComp->bEnableLUT
+		&& ActiveComp->LUTTexture != nullptr
+		&& ActiveComp->LUTTexture->GetResource() != nullptr
+		&& ActiveComp->LUTTexture->GetResource()->TextureRHI != nullptr
+		&& ActiveComp->LUTIntensity > 0.001f;
+
+	if (ActiveComp->bDebugHDRLogging)
+	{
+		const uint8 OutputMode = static_cast<uint8>(ActiveComp->HDROutputMode);
+		const bool bStateChanged =
+			!LastHDRRenderDebugState.bValid ||
+			LastHDRRenderDebugState.bWantEncode != bWantHDREncode ||
+			LastHDRRenderDebugState.bNeedEncode != bNeedHDREncode ||
+			LastHDRRenderDebugState.bLinearOutput != bLinearHDROutput ||
+			LastHDRRenderDebugState.OutputDevice != HDROutputDevice ||
+			LastHDRRenderDebugState.OutputMode != OutputMode ||
+			!FMath::IsNearlyEqual(LastHDRRenderDebugState.OutputMaxLuminance, HDRMaxDisplayNits, 0.5f) ||
+			!FMath::IsNearlyEqual(LastHDRRenderDebugState.PaperWhiteNits, ActiveComp->PaperWhiteNits, 0.5f);
+
+		if (bStateChanged)
+		{
+			UE_LOG(LogTemp, Log,
+				TEXT("ToneMapFX HDR render: WantEncode=%s NeedEncode=%s TrueHDRLinear=%s OutputDevice=%u MaxDisplayNits=%.1f Mode=%s PaperWhiteNits=%.1f LUTPass=%s"),
+				GetBoolText(bWantHDREncode),
+				GetBoolText(bNeedHDREncode),
+				GetBoolText(bLinearHDROutput),
+				HDROutputDevice,
+				HDRMaxDisplayNits,
+				GetHDROutputModeText(ActiveComp->HDROutputMode),
+				ActiveComp->PaperWhiteNits,
+				GetBoolText(bNeedLUT));
+
+			LastHDRRenderDebugState.bValid = true;
+			LastHDRRenderDebugState.bWantEncode = bWantHDREncode;
+			LastHDRRenderDebugState.bNeedEncode = bNeedHDREncode;
+			LastHDRRenderDebugState.bLinearOutput = bLinearHDROutput;
+			LastHDRRenderDebugState.OutputDevice = HDROutputDevice;
+			LastHDRRenderDebugState.OutputMode = OutputMode;
+			LastHDRRenderDebugState.OutputMaxLuminance = HDRMaxDisplayNits;
+			LastHDRRenderDebugState.PaperWhiteNits = ActiveComp->PaperWhiteNits;
+		}
+	}
+	else
+	{
+		LastHDRRenderDebugState.bValid = false;
 	}
 
 	FScreenPassRenderTarget FinalOutputTarget = OutputTarget;
@@ -1563,6 +2491,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 		// ---- ReplaceTonemap mode flag & exposure ----
 		P->bReplaceTonemap    = bIsReplaceTonemap ? 1.0f : 0.0f;
+		P->bLinearHDROutput   = bLinearHDROutput ? 1.0f : 0.0f;
 		P->OneOverPreExposure = 1.0f / FMath::Max(ViewInfo.PreExposure, 0.001f);
 		P->GlobalExposure     = FMath::Max(View.GetLastEyeAdaptationExposure(), 0.001f);
 
@@ -1582,7 +2511,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		P->MaxAutoExposure = ActiveComp->MaxAutoExposure;
 
 		// ---- Film Curve mode & Hable params ----
-		P->FilmCurveMode = (float)static_cast<uint8>(ActiveComp->FilmCurve);
+		P->FilmCurveMode = GetShaderFilmCurveMode(*ActiveComp);
 		P->HableParams1 = FVector4f(
 			ActiveComp->HableShoulderStrength,  // A
 			ActiveComp->HableLinearStrength,    // B
@@ -1594,6 +2523,17 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			ActiveComp->HableWhitePoint,        // W
 			0.0f);                              // unused
 		P->ReinhardWhitePoint = ActiveComp->ReinhardWhitePoint;
+		P->CustomCurveTexture = RegisterExternalTextureOrFallback(
+			GraphBuilder,
+			ActiveComp->CustomToneCurveTexture,
+			SceneColor.Texture,
+			TEXT("ToneMapCustomToneCurve"));
+		P->CustomCurveSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		P->CustomCurveParams = FVector4f(
+			ActiveComp->CustomCurveMinEV,
+			1.0f / FMath::Max(ActiveComp->CustomCurveMaxEV - ActiveComp->CustomCurveMinEV, 0.01f),
+			0.0f,
+			0.0f);
 		P->HDRSaturation  = ActiveComp->HDRSaturation;
 		P->HDRColorBalance = FVector3f(
 			ActiveComp->HDRColorBalance.R,
@@ -1701,6 +2641,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 		// --- HSL Smoothing ---
 		P->HSLSmoothing = ActiveComp->HSLSmoothing;
+		P->HSLMode = static_cast<float>(static_cast<uint8>(ActiveComp->HSLMode));
 
 		// --- Feature toggles ---
 		P->bEnableHSL    = ActiveComp->IsAnyHSLActive()   ? 1.0f : 0.0f;
@@ -1739,9 +2680,10 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			LP->View = ViewInfo.ViewUniformBuffer;
 			LP->LUTSize = LUTDim;
 			LP->bReplaceTonemap = bIsReplaceTonemap ? 1.0f : 0.0f;
+			LP->bLinearHDROutput = bLinearHDROutput ? 1.0f : 0.0f;
 
 			// Film Curve
-			LP->FilmCurveMode = (float)static_cast<uint8>(ActiveComp->FilmCurve);
+			LP->FilmCurveMode = GetShaderFilmCurveMode(*ActiveComp);
 			LP->HableParams1 = FVector4f(
 				ActiveComp->HableShoulderStrength,
 				ActiveComp->HableLinearStrength,
@@ -1753,6 +2695,17 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 				ActiveComp->HableWhitePoint,
 				0.0f);
 			LP->ReinhardWhitePoint = ActiveComp->ReinhardWhitePoint;
+			LP->CustomCurveTexture = RegisterExternalTextureOrFallback(
+				GraphBuilder,
+				ActiveComp->CustomToneCurveTexture,
+				SceneColor.Texture,
+				TEXT("ToneMapCustomToneCurveLUT"));
+			LP->CustomCurveSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+			LP->CustomCurveParams = FVector4f(
+				ActiveComp->CustomCurveMinEV,
+				1.0f / FMath::Max(ActiveComp->CustomCurveMaxEV - ActiveComp->CustomCurveMinEV, 0.01f),
+				0.0f,
+				0.0f);
 			LP->HDRSaturation = ActiveComp->HDRSaturation;
 			LP->HDRColorBalance = FVector3f(
 				ActiveComp->HDRColorBalance.R,
@@ -1812,6 +2765,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			LP->LumAdj1   = FVector4f(ActiveComp->LumReds, ActiveComp->LumOranges, ActiveComp->LumYellows, ActiveComp->LumGreens);
 			LP->LumAdj2   = FVector4f(ActiveComp->LumAquas, ActiveComp->LumBlues, ActiveComp->LumPurples, ActiveComp->LumMagentas);
 			LP->HSLSmoothing = ActiveComp->HSLSmoothing;
+			LP->HSLMode = static_cast<float>(static_cast<uint8>(ActiveComp->HSLMode));
 
 			// Feature toggles
 			LP->bEnableHSL    = ActiveComp->IsAnyHSLActive()  ? 1.0f : 0.0f;
@@ -1841,6 +2795,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			AP->InvLUTSize = 1.0f / LUTDim;
 
 			AP->bReplaceTonemap = bIsReplaceTonemap ? 1.0f : 0.0f;
+			AP->bLinearHDROutput = bLinearHDROutput ? 1.0f : 0.0f;
 
 			// Build screen transforms (same as per-pixel path)
 			const FIntPoint OutputExtent = FIntPoint(OutputTarget.Texture->Desc.Extent.X, OutputTarget.Texture->Desc.Extent.Y);
@@ -2004,7 +2959,12 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 		SP->SharpenAmount = ActiveComp->SharpenAmount;
 		SP->SharpenRadius = ActiveComp->SharpenRadius;
+		SP->SharpenMethod = static_cast<float>(static_cast<uint8>(ActiveComp->SharpenMethod));
+		SP->CASInputRange = bLinearHDROutput
+			? FMath::Max(HDRMaxDisplayNits / FMath::Max(ActiveComp->PaperWhiteNits, 1.0f), 1.0f)
+			: 1.0f;
 		SP->TexelSize     = FVector2f(1.0f / ViewportSize.X, 1.0f / ViewportSize.Y);
+		SP->bLinearHDROutput = bLinearHDROutput ? 1.0f : 0.0f;
 		SP->DitherQuantization = bSharpenIsLast ? DitherQuantizationValue : 0.0f;
 
 		SP->RenderTargets[0] = FRenderTargetBinding(SharpenOutputTarget.Texture, SharpenOutputTarget.LoadAction);
@@ -2144,6 +3104,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			ActiveComp->VignetteIntensity,
 			(float)static_cast<uint8>(ActiveComp->VignetteFalloff));
 		VP->FalloffExponent = ActiveComp->VignetteFalloffExponent;
+		VP->bLinearHDROutput = bLinearHDROutput ? 1.0f : 0.0f;
 
 		// Alpha texture (optional)
 		const bool bHasAlphaTex = ActiveComp->bVignetteUseAlphaTexture
@@ -2214,6 +3175,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 				FScreenTransform::ETextureBasis::TextureUV));
 
 		HP->OutputDeviceType = (float)HDROutputDevice;
+		HP->bInputIsLinearHDR = bLinearHDROutput ? 1.0f : 0.0f;
 		HP->PaperWhiteNits   = ActiveComp->PaperWhiteNits;
 		HP->MaxDisplayNits   = HDRMaxDisplayNits;
 		HP->DitherQuantization = bHDREncodeIsLast ? DitherQuantizationValue : 0.0f;

@@ -3,9 +3,13 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Components/SceneComponent.h"
+#include "Components/PrimitiveComponent.h"
 #include "Engine/Texture.h"
 #include "ToneMapComponent.generated.h"
+
+class UCurveFloat;
+class UCurveBase;
+class UTexture2D;
 
 // ============================================================================
 // Bloom enums
@@ -28,7 +32,9 @@ enum class EBloomBlendMode : uint8
 	/** Multiply blend - Darkens scene with bloom */
 	Multiply UMETA(DisplayName = "Multiply"),
 	/** Additive blend - Pure light addition (classic game bloom) */
-	Additive UMETA(DisplayName = "Additive (Classic)")
+	Additive UMETA(DisplayName = "Additive (Classic)"),
+	/** Soft light glow - soft-light character clamped so bloom never darkens the scene */
+	SoftLightGlow UMETA(DisplayName = "Soft Light Glow (No Darken)")
 };
 
 /** Bloom effect mode */
@@ -42,7 +48,21 @@ enum class EBloomMode : uint8
 	/** Kawase bloom - Progressive pyramid blur */
 	Kawase UMETA(DisplayName = "Kawase"),
 	/** Soft Focus - Dreamy full-scene glow effect */
-	SoftFocus UMETA(DisplayName = "Soft Focus (Dreamy Glow)")
+	SoftFocus UMETA(DisplayName = "Soft Focus (Dreamy Glow)"),
+	/** Soft Focus Glow - full-scene soft focus with a non-darkening soft-light composite */
+	SoftFocusGlow UMETA(DisplayName = "Soft Focus Glow (No Darken)")
+};
+
+/** Color treatment applied to the blurred bloom before intensity/composite. */
+UENUM(BlueprintType)
+enum class EBloomColorMode : uint8
+{
+	/** Preserve the source scene color in the bloom. */
+	SceneColor UMETA(DisplayName = "Scene Color"),
+	/** Convert bloom to grayscale luminance for the older monochrome bloom look. */
+	LegacyLuminance UMETA(DisplayName = "Legacy Luminance"),
+	/** Multiply the bloom by the Bloom Tint color. */
+	Tint UMETA(DisplayName = "Tint")
 };
 
 // ============================================================================
@@ -69,6 +89,16 @@ enum class EToneMapMode : uint8
 		ToolTip = "Replaces UE tonemapper entirely. HDR input. Disables ACES artifacts.")
 };
 
+/** HDR output transfer used when ReplaceTonemap is driving an HDR display. */
+UENUM(BlueprintType)
+enum class EToneMapHDROutputMode : uint8
+{
+	PaperWhiteNits UMETA(DisplayName = "Paper White Nits",
+		ToolTip = "Encodes the existing SDR-style tone-mapped result for HDR output. 1.0 maps to Paper White Nits."),
+	TrueHDR UMETA(DisplayName = "True HDR Output",
+		ToolTip = "Preserves linear values above 1.0 through the final HDR encode. 1.0 maps to Paper White Nits; higher values use HDR headroom.")
+};
+
 /** Film curve / tonemapping operator used in ReplaceTonemap mode */
 UENUM(BlueprintType)
 enum class EToneMapFilmCurve : uint8
@@ -86,7 +116,13 @@ enum class EToneMapFilmCurve : uint8
 	Fattal          UMETA(DisplayName = "Fattal et al. 2002 (Gradient Domain)",
 		ToolTip = "Fattal et al. 2002 gradient-domain tone mapping. Attenuates large luminance gradients while preserving fine detail. Multi-pass: gradient attenuation → divergence → iterative Poisson solve → reconstruct."),
 	AgX             UMETA(DisplayName = "AgX (Sobotka)",
-		ToolTip = "AgX display rendering transform by Troy Sobotka. Inset matrix → log2 encoding → sigmoid tone curve → outset matrix. Preserves hue and saturation through highlight compression with minimal color clipping.")
+		ToolTip = "AgX display rendering transform by Troy Sobotka. Inset matrix → log2 encoding → sigmoid tone curve → outset matrix. Preserves hue and saturation through highlight compression with minimal color clipping."),
+	ACESHill        UMETA(DisplayName = "ACES Hill Fit",
+		ToolTip = "Stephen Hill ACES filmic approximation Filmic contrast with ACES-style color transforms."),
+	ACESNarkowicz   UMETA(DisplayName = "ACES Narkowicz Fit",
+		ToolTip = "Krzysztof Narkowicz ACES filmic approximation Fast high-contrast filmic curve."),
+	CustomLuminanceCurve UMETA(DisplayName = "Custom Curve (Luminance)",
+		ToolTip = "Samples a CurveFloat across the configured EV range and applies it to scene luminance while preserving color ratios.")
 };
 
 /** Creative look applied after the AgX base rendering */
@@ -125,6 +161,56 @@ enum class EToneMapProcessingPath : uint8
 		ToolTip = "Every color operation evaluated analytically per screen pixel. Maximum mathematical precision."),
 	LUT       UMETA(DisplayName = "LUT (Performance)",
 		ToolTip = "Non-spatial operations baked into a 32x32x32 3D LUT, sampled with one trilinear fetch per pixel. Trades ALU for texture bandwidth — same visual quality with lower GPU cost. Use Dither Quantization for anti-banding.")
+};
+
+/** How this component contributes to the resolved ToneMapFX settings for a view. */
+UENUM(BlueprintType)
+enum class EToneMapBlendMode : uint8
+{
+	/** Applies everywhere with the component's blend weight. Matches the original global behavior. */
+	Global UMETA(DisplayName = "Global"),
+	/** Applies only inside a local bounding box, fading out across Blend Falloff Distance. */
+	BoundingBox UMETA(DisplayName = "Bounding Box")
+};
+
+/** Color space used when blending color settings across multiple Tone Map FX components. */
+UENUM(BlueprintType)
+enum class EToneMapColorBlendSpace : uint8
+{
+	/** Original component-wise interpolation in linear RGB. Preserves legacy project looks. */
+	LegacyLinearRGB UMETA(DisplayName = "Legacy Linear RGB"),
+	/** Perceptual interpolation that keeps transitions between different colors smoother. */
+	Oklab UMETA(DisplayName = "Oklab (Perceptual)")
+};
+
+/** HSL range/adjustment algorithm used by the color grading shader. */
+UENUM(BlueprintType)
+enum class EToneMapHSLMode : uint8
+{
+	/** Current smoother hue-range weighting and soft lightness adjustment. */
+	Smooth UMETA(DisplayName = "Smooth (Current)"),
+	/** Legacy-style HSL weighting and direct lightness scaling. */
+	Legacy UMETA(DisplayName = "Legacy")
+};
+
+/** Sharpening algorithm used by the Presence sharpening pass. */
+UENUM(BlueprintType)
+enum class EToneMapSharpenMethod : uint8
+{
+	/** Existing 9-tap unsharp mask. Preserves legacy project looks. */
+	LegacyUnsharpMask UMETA(DisplayName = "Legacy Unsharp Mask"),
+	/** AMD FidelityFX CAS-style contrast-adaptive sharpening. */
+	AMDCAS UMETA(DisplayName = "AMD CAS")
+};
+
+/** Shape used by the lenticular halo scatter pass. */
+UENUM(BlueprintType)
+enum class EToneMapHaloPattern : uint8
+{
+	/** Annular halo with broken-up arc variation. */
+	RingArcs UMETA(DisplayName = "Ring / Arcs"),
+	/** Bilateral stretched line gathers through bright sources. */
+	StretchedLines UMETA(DisplayName = "Stretched Lines")
 };
 
 // ============================================================================
@@ -172,16 +258,18 @@ enum class EVignetteTextureChannel : uint8
 };
 
 /**
- * Scene component that drives the Tone Map FX post-process effect.
+ * Primitive component that drives the Tone Map FX post-process effect.
  * Place on any actor to enable Photoshop Camera-Raw-style color grading.
  */
 UCLASS(ClassGroup=(Rendering), meta=(BlueprintSpawnableComponent, DisplayName="Tone Map FX"))
-class TONEMAPFX_API UToneMapComponent : public USceneComponent
+class TONEMAPFX_API UToneMapComponent : public UPrimitiveComponent
 {
 	GENERATED_BODY()
 
 public:
 	UToneMapComponent();
+
+	virtual void PostLoad() override;
 
 	// =========================================================================
 	// Master
@@ -191,6 +279,52 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map")
 	bool bEnabled = true;
 
+	// =========================================================================
+	// Blending
+	// =========================================================================
+
+	/** Spatial blend mode for this component. Global preserves the original single-look behavior. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending")
+	EToneMapBlendMode BlendMode = EToneMapBlendMode::Global;
+
+	/** Priority used for non-blendable choices such as render mode, textures, and enum-only effects. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending")
+	int32 BlendPriority = 0;
+
+	/** Overall contribution multiplier for this component before spatial falloff. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending",
+		meta=(ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float BlendWeight = 1.0f;
+
+	/** Color space used only when blending color-valued actor parameters such as bloom or halo tint.
+	    HSL smoothing is a separate per-pixel shader control. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending",
+		meta=(DisplayName = "Actor Color Blend Space"))
+	EToneMapColorBlendSpace ColorBlendSpace = EToneMapColorBlendSpace::LegacyLinearRGB;
+
+	/** Local-space half extents of the box where the component has full strength. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending",
+		meta=(EditCondition = "BlendMode == EToneMapBlendMode::BoundingBox",
+		      ClampMin = "0.0", UIMin = "0.0"))
+	FVector BlendBoxExtent = FVector(500.0f, 500.0f, 500.0f);
+
+	/** Distance outside the box used to fade this component to zero. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending",
+		meta=(EditCondition = "BlendMode == EToneMapBlendMode::BoundingBox",
+		      ClampMin = "0.0", UIMin = "0.0"))
+	float BlendFalloffDistance = 250.0f;
+
+	/** Draw the bounding-box blend area as a wireframe box in the viewport. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending",
+		meta=(EditCondition = "BlendMode == EToneMapBlendMode::BoundingBox"))
+	bool bShowBlendBounds = false;
+
+	/** Thickness of the viewport wireframe used by Show Blend Bounds. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Blending",
+		meta=(EditCondition = "BlendMode == EToneMapBlendMode::BoundingBox && bShowBlendBounds",
+		      ClampMin = "0.0", UIMin = "0.0", UIMax = "20.0"))
+	float BlendBoundsLineThickness = 2.0f;
+
 	/** Enable HDR output when running in ReplaceTonemap mode on an HDR monitor.
 	    When checked, the plugin outputs ST2084 (PQ) or scRGB instead of sRGB,
 	    matching the display's expected HDR encoding. Has no effect in PostProcess
@@ -199,10 +333,32 @@ public:
 		meta=(EditCondition = "Mode == EToneMapMode::ReplaceTonemap"))
 	bool bHDROutput = false;
 
-	/** Paper-white brightness in nits (cd/m²).  Controls how bright the tone-mapped
-	    white point appears on the HDR display.  80 = sRGB reference white (dim),
-	    200 = typical PC monitor paper-white, 400 = bright.  Only used when HDR
-	    Output is enabled. */
+	/** Automatically enables HDR output only when the active RHI/display reports
+	    HDR support and the engine allows HDR output. When unavailable, ToneMapFX
+	    falls back to SDR output instead of forcing HDR encoding. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map",
+		meta=(DisplayName = "Auto Detect HDR Display",
+		      EditCondition = "bHDROutput && Mode == EToneMapMode::ReplaceTonemap"))
+	bool bAutoDetectHDROutput = false;
+
+	/** Logs HDR output decisions when they change. Useful for verifying whether
+	    ToneMapFX requested HDR, whether the display/RHI allowed it, and whether
+	    the final HDR encode pass is active. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map",
+		meta=(DisplayName = "Debug HDR Logging",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap"))
+	bool bDebugHDRLogging = false;
+
+	/** HDR output behavior. Paper White Nits preserves the old SDR-in-HDR path.
+	    True HDR keeps tone-mapped linear values above 1.0 until PQ/scRGB encoding. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map",
+		meta=(DisplayName = "HDR Output Mode",
+		      EditCondition = "bHDROutput && Mode == EToneMapMode::ReplaceTonemap"))
+	EToneMapHDROutputMode HDROutputMode = EToneMapHDROutputMode::PaperWhiteNits;
+
+	/** Paper-white brightness in nits (cd/m2).  In Paper White mode this is the
+	    peak white of the SDR-style result. In True HDR mode, linear value 1.0
+	    maps to this brightness and values above 1.0 become HDR highlight headroom. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map",
 		meta=(EditCondition = "bHDROutput && Mode == EToneMapMode::ReplaceTonemap",
 		      ClampMin = "80.0", ClampMax = "500.0", UIMin = "80.0", UIMax = "500.0"))
@@ -314,7 +470,12 @@ public:
 		meta=(DisplayName = "Enable Sharpening"))
 	bool bEnableSharpening = false;
 
-	/** Sharpening strength (unsharp mask amount). */
+	/** Sharpening algorithm. Legacy preserves the old look; AMD CAS adapts to local contrast. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
+		meta=(EditCondition = "bEnableSharpening"))
+	EToneMapSharpenMethod SharpenMethod = EToneMapSharpenMethod::LegacyUnsharpMask;
+
+	/** Sharpening strength. For AMD CAS this maps to its 0-1 sharpness control. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
 		meta=(ClampMin = "0.0", ClampMax = "100.0", UIMin = "0.0", UIMax = "100.0",
 			  EditCondition = "bEnableSharpening"))
@@ -323,7 +484,7 @@ public:
 	/** Pixel radius for sharpening detection. Smaller = finer detail, larger = coarser edges. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Presence",
 		meta=(ClampMin = "0.5", ClampMax = "5.0", UIMin = "0.5", UIMax = "5.0",
-			  EditCondition = "bEnableSharpening"))
+			  EditCondition = "bEnableSharpening && SharpenMethod == EToneMapSharpenMethod::LegacyUnsharpMask"))
 	float SharpenRadius = 1.0f;
 
 	// =========================================================================
@@ -376,6 +537,10 @@ public:
 	// =========================================================================
 	// HSL — Range Controls
 	// =========================================================================
+
+	/** HSL algorithm. Smooth is the current softer hue blending; Legacy restores the older sharper range/lightness behavior. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|HSL")
+	EToneMapHSLMode HSLMode = EToneMapHSLMode::Smooth;
 
 	/** Controls how smoothly HSL adjustments blend between adjacent color ranges.
 	    Lower = sharper cutoff (more isolated color selection).
@@ -526,8 +691,7 @@ public:
 	// =========================================================================
 
 	/** Operating mode: PostProcess runs after UE tonemapper (safe, LDR);
-	    ReplaceTonemap replaces UE's entire tonemapper with Reinhard or
-	    Hable curve (HDR input, no ACES desaturation/glow/red-shift). */
+	    ReplaceTonemap replaces UE's entire tonemapper with the selected film curve. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Advanced")
 	EToneMapMode Mode = EToneMapMode::PostProcess;
 
@@ -664,8 +828,38 @@ public:
 	    Lower = brighter, more burn-to-white; very high = basic Reinhard (no clipping). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Reinhard",
 		meta=(ClampMin = "0.5", ClampMax = "100.0", UIMin = "1.0", UIMax = "20.0",
-		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve != EToneMapFilmCurve::Hable"))
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && (FilmCurve == EToneMapFilmCurve::ReinhardLuminance || FilmCurve == EToneMapFilmCurve::ReinhardJodie || FilmCurve == EToneMapFilmCurve::ReinhardStandard)"))
 	float ReinhardWhitePoint = 100.0f;
+
+	/** Custom tone curve asset. X is normalized 0..1 across CustomCurveMinEV..CustomCurveMaxEV; Y is mapped display-linear luminance. In True HDR output, Y can exceed 1.0 for HDR headroom. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Custom",
+		meta=(EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::CustomLuminanceCurve"))
+	TObjectPtr<UCurveFloat> CustomToneCurve = nullptr;
+
+	/** Minimum scene EV represented by the baked texture. Usually leave this at the default. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Custom",
+		meta=(ClampMin = "-24.0", ClampMax = "0.0", UIMin = "-16.0", UIMax = "-4.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::CustomLuminanceCurve",
+		      AdvancedDisplay))
+	float CustomCurveMinEV = -10.0f;
+
+	/** Maximum scene EV represented by the baked texture. Usually leave this at the default. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Custom",
+		meta=(ClampMin = "0.0", ClampMax = "24.0", UIMin = "2.0", UIMax = "12.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::CustomLuminanceCurve",
+		      AdvancedDisplay))
+	float CustomCurveMaxEV = 6.5f;
+
+	/** Number of samples baked from the CurveFloat into the GPU texture. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|Custom",
+		meta=(ClampMin = "64", ClampMax = "4096", UIMin = "256", UIMax = "2048",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::CustomLuminanceCurve",
+		      AdvancedDisplay))
+	int32 CustomCurveSampleCount = 1024;
+
+	/** Runtime texture baked from CustomToneCurve. Stored transiently and rebuilt after preset load. */
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> CustomToneCurveTexture = nullptr;
 
 	/** HDR color grading saturation (applied pre-curve in linear HDR).
 	    1.0 = neutral (default). 0 = monochrome. 2 = boosted. */
@@ -815,6 +1009,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects")
 	bool bEnableLenticularHalo = false;
 
+	/** Halo shape. Stretched Lines creates line-like lens scatter instead of a closed ring. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
+		meta=(EditCondition = "bEnableLenticularHalo"))
+	EToneMapHaloPattern HaloPattern = EToneMapHaloPattern::StretchedLines;
+
 	/** Overall brightness of the halo ring. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
 		meta=(ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0",
@@ -832,6 +1031,30 @@ public:
 		meta=(ClampMin = "0.002", ClampMax = "0.1", UIMin = "0.002", UIMax = "0.1",
 		      EditCondition = "bEnableLenticularHalo"))
 	float HaloThickness = 0.03f;
+
+	/** Breaks up the perfect circular halo with stable lens-like radial and angular variation. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
+		meta=(ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0",
+		      EditCondition = "bEnableLenticularHalo"))
+	float HaloIrregularity = 0.45f;
+
+	/** Smooths the halo into longer curved arcs instead of a uniform ring. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
+		meta=(ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0",
+		      EditCondition = "bEnableLenticularHalo"))
+	float HaloArcStretch = 0.35f;
+
+	/** Number of bilateral halo line directions. Only used by Stretched Lines. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
+		meta=(ClampMin = "1", ClampMax = "12", UIMin = "1", UIMax = "8",
+		      EditCondition = "bEnableLenticularHalo && HaloPattern == EToneMapHaloPattern::StretchedLines"))
+	int32 HaloLineCount = 5;
+
+	/** Width of each stretched halo line in screen pixels. Only used by Stretched Lines. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
+		meta=(ClampMin = "0.5", ClampMax = "40.0", UIMin = "0.5", UIMax = "20.0",
+		      EditCondition = "bEnableLenticularHalo && HaloPattern == EToneMapHaloPattern::StretchedLines"))
+	float HaloLineThickness = 5.0f;
 
 	/** Minimum source luminance that contributes to the halo. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Additional Lens Effects",
@@ -859,51 +1082,64 @@ public:
 
 	/** Overall intensity of the bloom effect */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
-		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "8.0", EditCondition = "bEnableBloom"))
+		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "32.0",
+		        SupportDynamicSliderMaxValue = "true", EditCondition = "bEnableBloom"))
 	float BloomIntensity = 1.0f;
 
 	/** Threshold for bloom - only pixels brighter than this will bloom */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
 		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "10.0",
-		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::SoftFocus"))
+		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::SoftFocus && BloomMode != EBloomMode::SoftFocusGlow"))
 	float BloomThreshold = 0.8f;
 
 	/** Softness of the bloom threshold edge (0 = hard cutoff, 1 = very wide soft knee).
 	 *  Higher values eliminate the visible 'cutoff circle' around very bright sources. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
 		meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0",
-		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::SoftFocus && BloomMode != EBloomMode::Kawase"))
+		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::SoftFocus && BloomMode != EBloomMode::SoftFocusGlow && BloomMode != EBloomMode::Kawase"))
 	float BloomThresholdSoftness = 0.5f;
 
-	/** Maximum HDR brightness fed into the bloom blur (0 = unlimited).
-	 *  Clamping extreme values prevents banding/quantization rings around
-	 *  very bright point sources like the sun or emissive meshes.
-	 *  Recommended: 5-20. Set to 0 to disable. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
-		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "100.0",
-		        EditCondition = "bEnableBloom && BloomMode != EBloomMode::Kawase"))
-	float BloomMaxBrightness = 1.0f;
+	/** Optional HDR source peak clamp before the bloom blur (0 = unlimited).
+	 *  This is a firefly/ring prevention control for ReplaceTonemap HDR input,
+	 *  not a final bloom intensity limiter. Use Protect Highlights for final
+	 *  soft limiting after Bloom Intensity. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Advanced",
+		meta = (DisplayName = "HDR Source Peak Clamp", ClampMin = "0.0", UIMin = "0.0", UIMax = "100.0",
+		        EditCondition = "bEnableBloom"))
+	float BloomMaxBrightness = 0.0f;
 
 	/** Size of the bloom effect */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
 		meta = (ClampMin = "0.0", UIMin = "0.0", UIMax = "64.0",
-		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::DirectionalGlare || BloomMode == EBloomMode::SoftFocus)"))
+		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::DirectionalGlare || BloomMode == EBloomMode::SoftFocus || BloomMode == EBloomMode::SoftFocusGlow)"))
 	float BloomSize = 16.0f;
 
-	/** Use scene colors for bloom (realistic) or apply tint color */
+	/** Source color treatment for bloom. Legacy Luminance restores the older monochrome bloom look. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
 		meta=(EditCondition = "bEnableBloom"))
+	EBloomColorMode BloomColorMode = EBloomColorMode::SceneColor;
+
+	/** Deprecated serialized compatibility setting. Use BloomColorMode instead. */
+	UPROPERTY(meta = (DeprecatedProperty, DeprecationMessage = "Use BloomColorMode instead."))
 	bool bUseSceneColor = true;
 
-	/** Tint color for the bloom (only used when Use Scene Color is disabled) */
+	/** Tint color for the bloom */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
-		meta = (EditCondition = "bEnableBloom && !bUseSceneColor"))
+		meta = (EditCondition = "bEnableBloom && BloomColorMode == EBloomColorMode::Tint"))
 	FLinearColor BloomTint = FLinearColor::White;
 
-	/** Blend mode for compositing bloom onto the scene */
+	/** Blend mode for compositing bloom onto the scene.
+	 *  Soft Focus Glow automatically uses Soft Light Glow to avoid darkening. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
 		meta=(EditCondition = "bEnableBloom"))
 	EBloomBlendMode BloomBlendMode = EBloomBlendMode::SoftLight;
+
+	/** Strength of the selected bloom blend mode. 0 = original scene, 1 = full blend result.
+	 *  Does not change bloom extraction or blur intensity. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
+		meta = (ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0",
+		        EditCondition = "bEnableBloom"))
+	float BloomBlendStrength = 1.0f;
 
 	/** Saturation boost for bloom colors (1.0 = normal) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom",
@@ -933,18 +1169,15 @@ public:
 	/** Number of blur passes (more passes = smoother bloom but slower) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
 		meta = (ClampMin = "1", ClampMax = "4", UIMin = "1", UIMax = "4",
-		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)"))
+		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus || BloomMode == EBloomMode::SoftFocusGlow)"))
 	int32 BlurPasses = 1;
 
-	/** Blur quality - number of samples per tap (5, 9, or 13) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
-		meta = (ClampMin = "5", ClampMax = "13", UIMin = "5", UIMax = "13",
-		        EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)"))
+	/** Reserved for future blur quality selection; current blur shader uses a fixed kernel. */
+	UPROPERTY()
 	int32 BlurSamples = 5;
 
-	/** Use high quality upsampling (slower but reduces pixelation) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Bloom|Quality",
-		meta = (EditCondition = "bEnableBloom && (BloomMode == EBloomMode::Standard || BloomMode == EBloomMode::SoftFocus)"))
+	/** Reserved for future upsampling quality selection. */
+	UPROPERTY()
 	bool bHighQualityUpsampling = false;
 
 	// ---- Directional Glare ----
@@ -1103,6 +1336,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Engine Overrides")
 	bool bDisableUnrealBloom = true;
 
+	/** Disable Unreal Engine's built-in motion blur (zeros MotionBlurAmount and MotionBlurMax).
+	 *  Useful for clean ToneMapFX evaluation without temporal smearing. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Engine Overrides")
+	bool bDisableUnrealMotionBlur = false;
+
 	// =========================================================================
 	// Presets (Save / Load to .txt files via OS file dialog)
 	// =========================================================================
@@ -1129,6 +1367,16 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Tone Map|Presets")
 	static FString GetPresetDirectory();
 
+	/** Returns this component's raw blend contribution for a world-space view location. */
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Tone Map|Blending")
+	float GetBlendWeightAtLocation(const FVector& ViewLocation) const;
+
+	/** Rebuilds the transient GPU texture used by Custom Curve (Luminance). */
+	UFUNCTION(BlueprintCallable, CallInEditor, Category = "Tone Map|Film Curve|Custom")
+	void RebuildCustomToneCurveTexture();
+
+	UTexture2D* GetCustomToneCurveTexture() const { return CustomToneCurveTexture.Get(); }
+
 	// =========================================================================
 	// Helpers
 	// =========================================================================
@@ -1140,6 +1388,8 @@ public:
 	bool IsAnyCurveActive() const;
 
 protected:
+	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
+	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
 	virtual void OnRegister() override;
 	virtual void OnUnregister() override;
 	virtual void BeginPlay() override;
@@ -1151,4 +1401,12 @@ protected:
 private:
 	void RegisterWithSubsystem();
 	void UnregisterFromSubsystem();
+#if WITH_EDITOR
+	void BindCustomToneCurveUpdate();
+	void UnbindCustomToneCurveUpdate();
+	void HandleCustomToneCurveUpdated(UCurveBase* Curve, EPropertyChangeType::Type ChangeType);
+
+	TWeakObjectPtr<UCurveFloat> BoundCustomToneCurve;
+	FDelegateHandle CustomToneCurveUpdateHandle;
+#endif
 };

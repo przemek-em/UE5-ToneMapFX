@@ -82,8 +82,13 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, BrightPassSampler)
 		SHADER_PARAMETER(FScreenTransform, SvPositionToBrightPassUV)
 		SHADER_PARAMETER(FVector4f, BufferSizeAndInvSize)
+		SHADER_PARAMETER(float, HaloPattern)
 		SHADER_PARAMETER(float, HaloRadius)     // UV units
 		SHADER_PARAMETER(float, HaloThickness)  // UV units (ring width)
+		SHADER_PARAMETER(float, HaloIrregularity)
+		SHADER_PARAMETER(float, HaloArcStretch)
+		SHADER_PARAMETER(int32, HaloLineCount)
+		SHADER_PARAMETER(float, HaloLineThickness)
 		SHADER_PARAMETER(float, HaloIntensity)
 		SHADER_PARAMETER(FVector3f, HaloTint)   // RGB tint for the ring
 		RENDER_TARGET_BINDING_SLOTS()
