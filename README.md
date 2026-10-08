@@ -4,7 +4,9 @@
 
 # Tone Map FX
 
-A post-process plugin for Unreal Engine 5.6.1+ that brings **Photo RAW style color grading** directly into the engine viewport. Run it on top of UE's built-in tonemapper, or **fully replace** ACES with classic film curves (Hable, Reinhard, Durand, Fattal, AgX, ACES fits, and custom luminance curves).
+A post-process plugin for Unreal Engine 5.6.1+ that brings **Photo RAW style color grading** directly into the engine viewport. Run it on top of UE's built-in tonemapper, or **fully replace** ACES with classic film curves (Hable, Reinhard, Durand, Fattal, AgX, ACES fits, Uchimura, and custom luminance curves). Choose Unreal's standard local exposure or the custom Durand prototype to adjust shadows and highlights before the selected film curve.
+
+Latest update: [GT / Uchimura and selectable local exposure — 09.10.2026](Changelogs/changelog_09.10.2026.md). Earlier updates are in [Changelogs](Changelogs/).
 ![Image](Screens/HighresScreenshot00041.jpg)
 
 ---
@@ -85,14 +87,65 @@ Multiple ToneMapFX actors/components can blend together in the same level.
 - **ACES Hill Fit** - Stephen Hill's ACES filmic approximation with ACES-style color transforms.
 - **ACES Narkowicz Fit** - Krzysztof Narkowicz's fast ACES filmic approximation.
 - **Custom Curve (Luminance)** - Uses a `CurveFloat` asset baked to a GPU texture. X maps across a configurable EV range; Y is output display-linear luminance and can exceed 1.0 in True HDR output.
+- **GT / Uchimura (Classic)** - Hajime Uchimura's six-parameter GT Sport curve, with a toe, straight middle section, and smooth highlight shoulder. Applied per RGB channel after conversion from the project's working color space to Rec.709. Available in both Per-Pixel and LUT processing paths.
 - **HDR Saturation & Color Balance** - Pre-curve adjustments in linear HDR
+
+#### GT / Uchimura Controls
+
+Select **Replace Tonemapper** and **GT / Uchimura (Classic)**, then open **Tone Map > Film Curve > GT Uchimura Classic**.
+
+| Control | Default | Effect |
+|---------|---------|--------|
+| Max Brightness | 1.0 | Output peak relative to paper white; values above 1 require True HDR Output and are capped to display headroom. |
+| Contrast | 1.0 | Slope of the straight middle section. |
+| Linear Start | 0.22 | Input value where the straight section starts. |
+| Linear Length | 0.4 | Fraction of the output range used by the straight section before the shoulder. |
+| Black Tightness | 1.33 | Toe power; higher values tighten the deepest shadows. |
+| Pedestal (Advanced) | 0.0 | Raises the black floor. |
+
+Parameters are validated together to keep the curve stable, including keeping Linear Start below Max Brightness and Pedestal below Linear Start. The release implementation uses the same curve and defaults as the testing plugin. See the [Uchimura reference notice](ThirdPartyNotices/GLSL-Tone-Map.txt).
 
 ### Auto-Exposure *(Replace Tonemapper Mode)*
 - **Manual (None)** - No automatic exposure. UE's built-in exposure is disabled automatically; only the manual Exposure slider applies.
 - **Engine Default** - UE's built-in eye adaptation remains active and passes exposure through.
 - **Krawczyk** (experimental) - Scene key estimation with temporal adaptation that mimics human eye behavior (fast bright-adapt, slow dark-adapt). UE's built-in exposure is disabled automatically.
 
-> **Exposure Independence:** When set to *Krawczyk* or *None*, ToneMapFX automatically neutralizes UE's entire exposure pipeline (forces `AEM_Manual`, zeros `AutoExposureBias`, disables physical camera exposure, and neutralizes local exposure settings) so that only ToneMapFX controls the scene brightness.
+> **Exposure Independence:** When set to *Krawczyk* or *None*, ToneMapFX neutralizes UE's global exposure (forces `AEM_Manual`, zeros `AutoExposureBias`, and disables physical camera exposure). Local exposure is controlled separately by **Local Exposure Method**, so it can be used with any of the three auto-exposure modes.
+
+### Local Exposure
+
+Use **Tone Map > Local Exposure > Local Exposure Method** to choose how local brightness is adjusted:
+
+| Method | Behavior |
+|--------|----------|
+| **Off** *(default)* | Disables local exposure while keeping global and manual exposure available. |
+| **Unreal (Post Process Volume)** | Uses the standard Post Process Volume local exposure controls, including **Bilateral** or **Exposure Fusion**. In Replace Tonemapper mode, the plugin applies the engine method before its film curve; in Post-Process mode, Unreal handles it in its normal pipeline. |
+| **Durand (Prototype)** | Uses plugin-controlled, edge-aware base-layer compression before the selected film curve. Requires Replace Tonemapper and a film curve other than Durand or Fattal. |
+
+The methods are exclusive: choosing Off or Durand neutralizes Unreal's local exposure settings. Choosing Unreal retains the volume settings even when auto exposure is None or Krawczyk. The Durand prepass is shared by **Per-Pixel** and **LUT** processing.
+
+#### Durand Local Exposure Controls
+
+The prototype adapts the existing Durand base/detail concept into a bounded exposure correction. It preserves fine luminance detail, RGB ratios, alpha, and HDR headroom, then continues through the chosen global film curve. The original **Durand-Dorsey film curve** remains a separate operator.
+
+| Control | Default | Effect |
+|---------|---------|--------|
+| Strength | 1.0 | Scales the correction in stops; 0 bypasses the custom passes. |
+| Spatial Sigma (Pixels) | 16 | Smoothing scale at full viewport resolution; sampling reaches at most 32 pixels on either side per axis. |
+| Edge Range (Stops) | 1.16 | Edge sensitivity; smaller values reduce smoothing across luminance boundaries. |
+| Highlight Contrast | 0.85 | Lower values darken bright base-layer regions; 1 is neutral. |
+| Shadow Contrast | 0.85 | Lower values lift dark base-layer regions; 1 is neutral. |
+| Maximum Shadow Lift (Stops) | 1.0 | Caps lifting before Strength; 0 disables lifting. |
+| Maximum Highlight Darkening (Stops) | 1.0 | Caps darkening before Strength; 0 disables darkening. |
+| Midtone Protection (Stops) | 1.0 | Protects the interval around middle gray, with a smooth onset outside it. |
+| Middle Grey Bias (Stops) | 0.0 | Moves the 0.18 middle-gray pivot. |
+| Protect Deep Shadows | On | Fades lifting near black to limit amplification of deep-shadow noise. |
+
+To lift shadows, select **Durand (Prototype)** with a global curve such as Uchimura, AgX, or Hable, then lower **Shadow Contrast** and adjust **Maximum Shadow Lift**. Set **Highlight Contrast** to 1 if only shadow recovery is wanted. Plugin manual exposure remains downstream of the local correction.
+
+The custom filter works at full resolution against the original luminance guide, without mixing in a Gaussian base or reconstructing a lower-resolution result. It uses four fullscreen passes plus exposure setup. This is a spatial prototype: GPU timings and temporal behavior still need evaluation; guided filtering, temporal stabilization, and custom exposure fusion remain proposed extensions.
+
+See the [prototype guide](Docs/LocalExposurePrototype.md) for comparison settings and implementation details, and the [research/design note](Docs/CustomLocalExposureResearch.md) for references and future options.
 
 ### Bloom
 Five bloom styles:
@@ -130,6 +183,8 @@ Optional dual-path architecture for the main color grading pass.
 
 - **Per-Pixel (Full Quality)** — default. Every color operation evaluated analytically per screen pixel.
 - **LUT (Performance)** — bakes 14 non-spatial color operations (WhiteBalance, Exposure, Contrast, HSL, Vibrance, Saturation, Film Curve, Tone Curve, etc.) into a 32×32×32 3D LUT. Each pixel does a single trilinear texture fetch instead of the full math chain. Spatial operations (Clarity, Dynamic Contrast) still run per-pixel after the LUT lookup.
+
+Local exposure runs on the HDR scene before either main processing path; it is not baked into the color LUT. Uchimura is evaluated analytically in Per-Pixel mode and baked as the film curve in LUT mode.
 
 Both paths produce virtually identical visual output. The LUT path trades ALU for texture bandwidth — a GPU performance win on complex grading setups.
 
@@ -180,13 +235,15 @@ Save and load all ToneMapFX settings to `.txt` files using OS native file dialog
 - `SavePresetToPath()` / `LoadPresetFromPath()` - Blueprint-callable API
 - Reflection-based serialization — automatically handles all property types including enums, colors, textures, and vectors
 - Custom curve asset references and generated curve textures are rebuilt after loading
+- Uchimura parameters, Local Exposure Method, and Durand local exposure controls are saved and loaded
+- Presets from the earlier **Enable Unreal Local Exposure** checkbox migrate to the new method selector; a saved selector takes precedence if both fields are present
 - Presets are forward/backward compatible — unknown properties are skipped gracefully
 
 ### Engine Overrides
 - **Disable Unreal Bloom** - Zeros UE's `BloomIntensity` to prevent double-bloom when using ToneMapFX bloom (enabled by default)
 - **Disable Unreal Motion Blur** - Zeros UE's `MotionBlurAmount` and `MotionBlurMax` for clean ToneMapFX evaluation without temporal smearing
 - **Replace Tonemapper Cleanup** - Zeros UE's `ToneCurveAmount`, `ExpandGamut`, and `BlueCorrection` so the plugin owns the final film response
-- **Automatic Exposure Neutralization** - When exposure mode is *Krawczyk* or *None*, UE's entire exposure system is disabled (see Auto-Exposure section)
+- **Automatic Exposure Neutralization** - When exposure mode is *Krawczyk* or *None*, UE's global exposure is neutralized. Local exposure follows the separate **Local Exposure Method** selector (see Local Exposure section).
 - **Force FP16 Pipeline** - Forces UE's entire post-processing chain to use `PF_FloatRGBA` (FP16, 64bpp) precision by toggling `r.PostProcessing.PropagateAlpha` at runtime. Prevents banding from 10-bit/11-bit quantization in TAA/TSR and tonemapper output. Enabled by default. Doubles bandwidth of post-process passes — small cost on modern hardware, significant quality improvement in smooth gradients.
 
 ### Output Dithering
@@ -232,6 +289,9 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - [x] ~~Lenticular halo improvements~~ *(done — Ring / Arcs and Stretched Lines patterns with line count/thickness controls)*
 - [x] ~~Bloom compositing controls~~ *(done - Bloom Color Mode, Soft Light Glow, and Bloom Blend Strength)*
 - [x] ~~Unreal motion blur override~~ *(done - direct MotionBlurAmount/MotionBlurMax neutralization)*
+- [x] ~~GT / Uchimura classic tone mapper~~ *(done — six controls, Per-Pixel/LUT integration, HDR-aware output peak)*
+- [x] ~~Selectable local exposure~~ *(done — Off by default, Unreal Post Process Volume integration, and custom Durand prototype)*
+- [ ] Custom local exposure: GPU profiling, temporal stabilization, and evaluation of guided filtering / exposure fusion
 - [ ] LUT export
 - [ ] Additional RGB curves
 - [ ] Texture overlay

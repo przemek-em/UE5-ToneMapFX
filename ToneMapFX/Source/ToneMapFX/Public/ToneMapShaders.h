@@ -69,10 +69,13 @@ public:
 		SHADER_PARAMETER(float, GlobalExposure)
 
 		// Film Curve params (ReplaceTonemap mode)
-		SHADER_PARAMETER(float, FilmCurveMode) // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX, 7=ACESHill, 8=ACESNarkowicz, 9=CustomLuminance
+		SHADER_PARAMETER(float, FilmCurveMode) // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX, 7=ACESHill, 8=ACESNarkowicz, 9=CustomLuminance, 10=GTUchimuraClassic
 		SHADER_PARAMETER(FVector4f, HableParams1) // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 		SHADER_PARAMETER(FVector4f, HableParams2) // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
 		SHADER_PARAMETER(float, ReinhardWhitePoint)
+		SHADER_PARAMETER(FVector4f, UchimuraParams1) // x=Peak, y=Contrast, z=LinearStart, w=LinearLength
+		SHADER_PARAMETER(FVector2f, UchimuraParams2) // x=BlackTightness, y=Pedestal
+		SHADER_PARAMETER(FMatrix44f, WorkingToRec709)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CustomCurveTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, CustomCurveSampler)
 		SHADER_PARAMETER(FVector4f, CustomCurveParams) // x=MinEV, y=InvEVRange, zw=unused

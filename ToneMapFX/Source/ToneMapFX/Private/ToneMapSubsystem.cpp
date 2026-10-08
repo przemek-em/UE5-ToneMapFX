@@ -6,6 +6,10 @@
 #include "ClassicBloomShaders.h"
 #include "ToneMapDurand.h"
 #include "ToneMapFattal.h"
+#include "ToneMapUchimura.h"
+#include "ToneMapLocalExposure.h"
+#include "ToneMapCustomLocalExposure.h"
+#include "ColorManagement/ColorSpace.h"
 #include "ToneMapLensEffects.h"
 #include "ToneMapVignetteShaders.h"
 #include "ToneMapSharpenShaders.h"
@@ -73,6 +77,17 @@ struct FToneMapResolvedSettings
 	bool bEnableSharpening = false;
 	bool bDisableUnrealBloom = true;
 	bool bDisableUnrealMotionBlur = false;
+	EToneMapLocalExposureMode LocalExposureMode = EToneMapLocalExposureMode::Off;
+	bool bLocalExposureProtectDeepShadows = true;
+	float LocalExposureStrength = 1.0f;
+	float LocalExposureSpatialSigma = 16.0f;
+	float LocalExposureRangeSigmaEV = 1.16f;
+	float LocalExposureHighlightContrast = 0.85f;
+	float LocalExposureShadowContrast = 0.85f;
+	float LocalExposureMaxLiftEV = 1.0f;
+	float LocalExposureMaxDarkenEV = 1.0f;
+	float LocalExposureMidtoneProtectionEV = 1.0f;
+	float LocalExposureMiddleGreyBias = 0.0f;
 
 	float PaperWhiteNits = 200.0f;
 	float Temperature = 0.0f;
@@ -139,6 +154,12 @@ struct FToneMapResolvedSettings
 	float HableToeDenominator = 0.30f;
 	float HableWhitePoint = 11.2f;
 	float ReinhardWhitePoint = 100.0f;
+	float UchimuraMaxBrightness = 1.0f;
+	float UchimuraContrast = 1.0f;
+	float UchimuraLinearStart = 0.22f;
+	float UchimuraLinearLength = 0.4f;
+	float UchimuraBlackTightness = 1.33f;
+	float UchimuraPedestal = 0.0f;
 	float CustomCurveMinEV = -10.0f;
 	float CustomCurveMaxEV = 6.5f;
 	float HDRSaturation = 1.0f;
@@ -282,6 +303,17 @@ static void CopyToneMapSettings(const UToneMapComponent& Component, FToneMapReso
 	COPY_FIELD(bEnableSharpening);
 	COPY_FIELD(bDisableUnrealBloom);
 	COPY_FIELD(bDisableUnrealMotionBlur);
+	COPY_FIELD(LocalExposureMode);
+	COPY_FIELD(bLocalExposureProtectDeepShadows);
+	COPY_FIELD(LocalExposureStrength);
+	COPY_FIELD(LocalExposureSpatialSigma);
+	COPY_FIELD(LocalExposureRangeSigmaEV);
+	COPY_FIELD(LocalExposureHighlightContrast);
+	COPY_FIELD(LocalExposureShadowContrast);
+	COPY_FIELD(LocalExposureMaxLiftEV);
+	COPY_FIELD(LocalExposureMaxDarkenEV);
+	COPY_FIELD(LocalExposureMidtoneProtectionEV);
+	COPY_FIELD(LocalExposureMiddleGreyBias);
 	COPY_FIELD(PaperWhiteNits);
 	COPY_FIELD(Temperature);
 	COPY_FIELD(Tint);
@@ -347,6 +379,12 @@ static void CopyToneMapSettings(const UToneMapComponent& Component, FToneMapReso
 	COPY_FIELD(HableToeDenominator);
 	COPY_FIELD(HableWhitePoint);
 	COPY_FIELD(ReinhardWhitePoint);
+	COPY_FIELD(UchimuraMaxBrightness);
+	COPY_FIELD(UchimuraContrast);
+	COPY_FIELD(UchimuraLinearStart);
+	COPY_FIELD(UchimuraLinearLength);
+	COPY_FIELD(UchimuraBlackTightness);
+	COPY_FIELD(UchimuraPedestal);
 	COPY_FIELD(CustomCurveMinEV);
 	COPY_FIELD(CustomCurveMaxEV);
 	COPY_FIELD(HDRSaturation);
@@ -654,6 +692,22 @@ static bool ResolveToneMapSettings(
 	BLEND_FIELD(ContrastMidpoint);
 	BLEND_FIELD(Clarity);
 	BLEND_FIELD(ClarityRadius);
+	// Only custom-enabled contributions fade in the custom exposure strength.
+	OutSettings.LocalExposureStrength = BlendFloat(0.0f, Candidates, TotalWeight, [](const UToneMapComponent* Component)
+	{
+		return Component->LocalExposureMode == EToneMapLocalExposureMode::Durand &&
+			Component->Mode == EToneMapMode::ReplaceTonemap &&
+			Component->FilmCurve != EToneMapFilmCurve::Durand && Component->FilmCurve != EToneMapFilmCurve::Fattal
+			? Component->LocalExposureStrength : 0.0f;
+	});
+	BLEND_FIELD(LocalExposureSpatialSigma);
+	BLEND_FIELD(LocalExposureRangeSigmaEV);
+	BLEND_FIELD(LocalExposureHighlightContrast);
+	BLEND_FIELD(LocalExposureShadowContrast);
+	BLEND_FIELD(LocalExposureMaxLiftEV);
+	BLEND_FIELD(LocalExposureMaxDarkenEV);
+	BLEND_FIELD(LocalExposureMidtoneProtectionEV);
+	BLEND_FIELD(LocalExposureMiddleGreyBias);
 	BLEND_FIELD(Vibrance);
 	BLEND_FIELD(Saturation);
 	BLEND_EFFECT_FIELD(SharpenAmount, 0.0f, bEnableSharpening);
@@ -704,6 +758,12 @@ static bool ResolveToneMapSettings(
 	BLEND_FIELD(HableToeDenominator);
 	BLEND_FIELD(HableWhitePoint);
 	BLEND_FIELD(ReinhardWhitePoint);
+	BLEND_FIELD(UchimuraMaxBrightness);
+	BLEND_FIELD(UchimuraContrast);
+	BLEND_FIELD(UchimuraLinearStart);
+	BLEND_FIELD(UchimuraLinearLength);
+	BLEND_FIELD(UchimuraBlackTightness);
+	BLEND_FIELD(UchimuraPedestal);
 	BLEND_FIELD(HDRSaturation);
 	BLEND_COLOR_FIELD(HDRColorBalance);
 	BLEND_FIELD(DurandSpatialSigma);
@@ -992,7 +1052,6 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 			//   AutoExposureMethod       -> AEM_Manual   (no histogram/basic GPU pass)
 			//   AutoExposureBias         -> 0            (pow(2, bias) scales PreExposure)
 			//   PhysicalCameraExposure   -> false        (no ISO/aperture influence)
-			//   LocalExposure settings   -> neutral      (average feeds back into PreExposure)
 			const bool bNeedNeutralExposure = bCachedReplaceTonemap &&
 				ResolvedSettings.AutoExposureMode != EToneMapAutoExposure::EngineDefault;
 
@@ -1006,8 +1065,12 @@ void FToneMapSceneViewExtension::SetupView(FSceneViewFamily& InViewFamily, FScen
 
 				InView.FinalPostProcessSettings.bOverride_AutoExposureApplyPhysicalCameraExposure = 1;
 				InView.FinalPostProcessSettings.AutoExposureApplyPhysicalCameraExposure = false;
+			}
 
-				// Neutralise local exposure so its average doesn't feed back into PreExposure
+			// Only Unreal mode retains volume local exposure. Off and custom modes neutralise
+			// all of the renderer's enable conditions, independently of auto exposure.
+			if (ResolvedSettings.LocalExposureMode != EToneMapLocalExposureMode::Unreal)
+			{
 				InView.FinalPostProcessSettings.bOverride_LocalExposureHighlightContrastScale = 1;
 				InView.FinalPostProcessSettings.LocalExposureHighlightContrastScale = 1.0f;
 				InView.FinalPostProcessSettings.bOverride_LocalExposureShadowContrastScale = 1;
@@ -1615,7 +1678,7 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 	// bIsReplaceTonemap already determined above
 
-	const FScreenPassTextureViewport SceneColorViewport(SceneColor);
+	FScreenPassTextureViewport SceneColorViewport(SceneColor);
 	const FIntPoint ViewportSize = SceneColorViewport.Rect.Size();
 
 	// =====================================================================
@@ -1723,6 +1786,33 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 
 		// Extract adapted luminance for next frame's temporal blending
 		GraphBuilder.QueueTextureExtraction(AdaptedLumTexture, &AdaptedLuminanceRT);
+	}
+
+	if (bIsReplaceTonemap && ActiveComp->LocalExposureMode == EToneMapLocalExposureMode::Unreal)
+	{
+		SceneColor = AddToneMapLocalExposurePass(GraphBuilder, ViewInfo, SceneColor,
+			static_cast<uint8>(ActiveComp->AutoExposureMode), AdaptedLumTexture,
+			ActiveComp->MinAutoExposure, ActiveComp->MaxAutoExposure);
+		SceneColorViewport = FScreenPassTextureViewport(SceneColor);
+	}
+	else if (bIsReplaceTonemap && ActiveComp->LocalExposureMode == EToneMapLocalExposureMode::Durand &&
+		ActiveComp->FilmCurve != EToneMapFilmCurve::Durand && ActiveComp->FilmCurve != EToneMapFilmCurve::Fattal)
+	{
+		FToneMapCustomLocalExposureSettings LocalSettings;
+		LocalSettings.Strength = ActiveComp->LocalExposureStrength;
+		LocalSettings.SpatialSigma = ActiveComp->LocalExposureSpatialSigma;
+		LocalSettings.RangeSigmaEV = ActiveComp->LocalExposureRangeSigmaEV;
+		LocalSettings.HighlightContrast = ActiveComp->LocalExposureHighlightContrast;
+		LocalSettings.ShadowContrast = ActiveComp->LocalExposureShadowContrast;
+		LocalSettings.MaxLiftEV = ActiveComp->LocalExposureMaxLiftEV;
+		LocalSettings.MaxDarkenEV = ActiveComp->LocalExposureMaxDarkenEV;
+		LocalSettings.MidtoneProtectionEV = ActiveComp->LocalExposureMidtoneProtectionEV;
+		LocalSettings.MiddleGreyBias = ActiveComp->LocalExposureMiddleGreyBias;
+		LocalSettings.bProtectDeepShadows = ActiveComp->bLocalExposureProtectDeepShadows;
+		SceneColor = AddToneMapCustomLocalExposurePass(GraphBuilder, ViewInfo, SceneColor,
+			static_cast<uint8>(ActiveComp->AutoExposureMode), AdaptedLumTexture,
+			ActiveComp->MinAutoExposure, ActiveComp->MaxAutoExposure, LocalSettings);
+		SceneColorViewport = FScreenPassTextureViewport(SceneColor);
 	}
 
 	// =====================================================================
@@ -2324,6 +2414,24 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 		bNeedHDREncode = (HDROutputDevice >= 3);
 	}
 	const bool bLinearHDROutput = bNeedHDREncode && ActiveComp->HDROutputMode == EToneMapHDROutputMode::TrueHDR;
+	const float ToneMapReferenceWhiteNits = bNeedHDREncode
+		? FMath::Max(ActiveComp->PaperWhiteNits, 1.0f)
+		: 100.0f;
+	const float ToneMapOutputPeakNits = bLinearHDROutput
+		? FMath::Max(HDRMaxDisplayNits, ToneMapReferenceWhiteNits)
+		: ToneMapReferenceWhiteNits;
+	const float ToneMapOutputPeakScale = ToneMapOutputPeakNits / ToneMapReferenceWhiteNits;
+	const FMatrix44f WorkingToRec709 = UE::Color::Transpose<float>(
+		UE::Color::FColorSpaceTransform::GetWorkingColorSpaceToSRGB());
+	const ToneMapFX::Uchimura::FParameters UchimuraParameters = ToneMapFX::Uchimura::BuildParameters(
+		ActiveComp->UchimuraMaxBrightness,
+		ActiveComp->UchimuraContrast,
+		ActiveComp->UchimuraLinearStart,
+		ActiveComp->UchimuraLinearLength,
+		ActiveComp->UchimuraBlackTightness,
+		ActiveComp->UchimuraPedestal,
+		ToneMapOutputPeakScale);
+
 	const bool bNeedLUT = !bLinearHDROutput
 		&& ActiveComp->bEnableLUT
 		&& ActiveComp->LUTTexture != nullptr
@@ -2523,6 +2631,9 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 			ActiveComp->HableWhitePoint,        // W
 			0.0f);                              // unused
 		P->ReinhardWhitePoint = ActiveComp->ReinhardWhitePoint;
+		P->UchimuraParams1 = UchimuraParameters.Curve;
+		P->UchimuraParams2 = UchimuraParameters.Toe;
+		P->WorkingToRec709 = WorkingToRec709;
 		P->CustomCurveTexture = RegisterExternalTextureOrFallback(
 			GraphBuilder,
 			ActiveComp->CustomToneCurveTexture,
@@ -2695,6 +2806,9 @@ FScreenPassTexture FToneMapSceneViewExtension::PostProcessPass_RenderThread(
 				ActiveComp->HableWhitePoint,
 				0.0f);
 			LP->ReinhardWhitePoint = ActiveComp->ReinhardWhitePoint;
+			LP->UchimuraParams1 = UchimuraParameters.Curve;
+			LP->UchimuraParams2 = UchimuraParameters.Toe;
+			LP->WorkingToRec709 = WorkingToRec709;
 			LP->CustomCurveTexture = RegisterExternalTextureOrFallback(
 				GraphBuilder,
 				ActiveComp->CustomToneCurveTexture,

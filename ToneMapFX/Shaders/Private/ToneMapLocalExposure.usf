@@ -1,0 +1,60 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+#include "/Engine/Private/PostProcessHistogramCommon.ush"
+
+StructuredBuffer<float4> EngineEyeAdaptationBuffer;
+RWStructuredBuffer<float4> EyeAdaptationOutput;
+Texture2D AdaptedLumTexture;
+float GlobalExposure;
+uint AutoExposureMode;
+float MinAutoExposure;
+float MaxAutoExposure;
+
+// Match the exposure actually used by ToneMapProcess and ToneMapApplyLUT.
+[numthreads(1, 1, 1)]
+void SetupExposureCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	float exposure = 1.0;
+	float middleGrey = 1.0;
+	if (AutoExposureMode == 2)
+	{
+		float adaptedLum = AdaptedLumTexture.Load(int3(0, 0, 0)).r;
+		float sceneKey = 1.03 - 2.0 / (2.0 + log2(adaptedLum + 1.0));
+		exposure = clamp(sceneKey / max(adaptedLum, 0.0001), MinAutoExposure, MaxAutoExposure);
+	}
+	else if (AutoExposureMode == 1)
+	{
+		exposure = GlobalExposure;
+		middleGrey = max(EngineEyeAdaptationBuffer[0].w, 0.0001);
+	}
+	EyeAdaptationOutput[0] = float4(exposure, 0.0, 0.0, middleGrey);
+}
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+SCREEN_PASS_TEXTURE_VIEWPORT(Fusion)
+Texture2D InputTexture;
+Texture2D FusionTexture;
+SamplerState TextureSampler;
+StructuredBuffer<float4> EyeAdaptationBuffer;
+RWTexture2D<float4> OutputFloat4;
+
+// Fusion blends luminance in its own temporary film-curve space. Convert it
+// back to a scene-linear multiplier before the user's selected tonemapper.
+[numthreads(8, 8, 1)]
+void ApplyFusionCS(uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 pixel = Output_ViewportMin + DispatchThreadId;
+	if (any(pixel >= (uint2)Output_ViewportMax))
+		return;
+	float2 uv = (DispatchThreadId + 0.5) * Output_ViewportSizeInverse;
+	uv = Fusion_UVViewportMin + uv * Fusion_UVViewportSize;
+	uv = clamp(uv, Fusion_UVViewportBilinearMin, Fusion_UVViewportBilinearMax);
+	float4 color = InputTexture.Load(uint3(Input_ViewportMin + DispatchThreadId, 0));
+	float lum = CalculateEyeAdaptationLuminance(color.rgb * View.OneOverPreExposure * EyeAdaptationBuffer[0].x);
+	float fusionLum = Texture2DSampleLevel(FusionTexture, TextureSampler, uv, 0).r;
+	color.rgb *= CalculateFusionLocalExposure(lum, fusionLum);
+	OutputFloat4[pixel] = color;
+}

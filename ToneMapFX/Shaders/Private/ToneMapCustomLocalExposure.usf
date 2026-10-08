@@ -1,0 +1,90 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Durand-style base/detail exposure correction, separate from the film curve.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+Texture2D SceneColorTexture;
+SamplerState SceneColorSampler;
+FScreenTransform SvPositionToSceneColorUV;
+float OneOverPreExposure;
+float3 LuminanceWeights;
+Texture2D LogLumTexture;
+Texture2D GuideTexture;
+Texture2D BaseLayerTexture;
+int2 WorkSize;
+int2 BlurDirection;
+float SpatialSigma;
+float RangeSigmaEV;
+StructuredBuffer<float4> EyeAdaptationBuffer;
+float Strength;
+float HighlightContrast;
+float ShadowContrast;
+float MaxLiftEV;
+float MaxDarkenEV;
+float MidtoneProtectionEV;
+float MiddleGreyBias;
+uint ProtectDeepShadows;
+
+void LogLumPS(float4 SvPosition : SV_Position, out float OutLogLum : SV_Target0)
+{
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float3 scene = max(Texture2DSample(SceneColorTexture, SceneColorSampler, uv).rgb * OneOverPreExposure, 0.0);
+	OutLogLum = log2(max(dot(scene, LuminanceWeights), 1e-6));
+}
+
+void BilateralPS(float4 SvPosition : SV_Position, out float OutBase : SV_Target0)
+{
+	int2 pixel = int2(SvPosition.xy);
+	// Both sides of the range comparison use the original guide. In particular,
+	// the vertical pass must not compare a filtered center to an original neighbor.
+	float centerGuide = GuideTexture.Load(int3(pixel, 0)).r;
+	float invSpatialVariance = 0.5 / (SpatialSigma * SpatialSigma);
+	float invRangeVariance = 0.5 / (RangeSigmaEV * RangeSigmaEV);
+	// Match the existing Durand prototype's bounded 65-tap maximum per axis.
+	int halfKernel = clamp((int)(3.0 * SpatialSigma + 0.5), 1, 32);
+	float sum = 0.0;
+	float sumWeight = 0.0;
+	LOOP
+	for (int i = -halfKernel; i <= halfKernel; ++i)
+	{
+		int2 samplePixel = clamp(pixel + BlurDirection * i, int2(0, 0), WorkSize - 1);
+		float sampleValue = LogLumTexture.Load(int3(samplePixel, 0)).r;
+		float guideValue = GuideTexture.Load(int3(samplePixel, 0)).r;
+		float rangeDistance = centerGuide - guideValue;
+		float weight = exp(-float(i * i) * invSpatialVariance - rangeDistance * rangeDistance * invRangeVariance);
+		sum += sampleValue * weight;
+		sumWeight += weight;
+	}
+	OutBase = sum / max(sumWeight, 1e-8);
+}
+
+void ApplyPS(float4 SvPosition : SV_Position, out float4 OutColor : SV_Target0)
+{
+	int2 pixel = int2(SvPosition.xy);
+	float2 uv = ApplyScreenTransform(SvPosition.xy, SvPositionToSceneColorUV);
+	float4 scene = Texture2DSample(SceneColorTexture, SceneColorSampler, uv);
+	// A uniform exposure is an additive log shift and leaves bilateral weights
+	// unchanged, so analysis can stay in unexposed scene space until this pass.
+	float exposureEV = log2(max(EyeAdaptationBuffer[0].x, 1e-6));
+	float logLum = LogLumTexture.Load(int3(pixel, 0)).r + exposureEV;
+	float base = BaseLayerTexture.Load(int3(pixel, 0)).r + exposureEV;
+	float pivot = log2(0.18) + MiddleGreyBias;
+	float centeredBase = base - pivot;
+	float contrast = centeredBase > 0.0 ? HighlightContrast : ShadowContrast;
+	float distanceFromProtectedRange = max(abs(centeredBase) - MidtoneProtectionEV, 0.0);
+	float adjustedBase = sign(centeredBase) * distanceFromProtectedRange;
+	// Detail remains at strength 1. Only the low-frequency base contributes to
+	// the exposure correction; a one-stop smooth onset protects the midtones.
+	float deltaEV = (contrast - 1.0) * adjustedBase * smoothstep(0.0, 1.0, distanceFromProtectedRange);
+	if (ProtectDeepShadows != 0 && deltaEV > 0.0)
+	{
+		// Fade lifting of near-black/noisy pixels without changing the RGB source.
+		deltaEV *= smoothstep(pivot - 12.0, pivot - 8.0, logLum);
+	}
+	deltaEV = clamp(deltaEV, -MaxDarkenEV, MaxLiftEV) * Strength;
+	// Preserve pre-exposure, alpha, HDR headroom and the selected global curve.
+	// Manual plugin exposure remains downstream and is not canceled here.
+	OutColor = float4(scene.rgb * exp2(deltaEV), scene.a);
+}

@@ -34,6 +34,9 @@ public:
 		SHADER_PARAMETER(FVector4f, HableParams1)
 		SHADER_PARAMETER(FVector4f, HableParams2)
 		SHADER_PARAMETER(float, ReinhardWhitePoint)
+		SHADER_PARAMETER(FVector4f, UchimuraParams1) // x=Peak, y=Contrast, z=LinearStart, w=LinearLength
+		SHADER_PARAMETER(FVector2f, UchimuraParams2) // x=BlackTightness, y=Pedestal
+		SHADER_PARAMETER(FMatrix44f, WorkingToRec709)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, CustomCurveTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, CustomCurveSampler)
 		SHADER_PARAMETER(FVector4f, CustomCurveParams)

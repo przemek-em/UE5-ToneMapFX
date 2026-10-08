@@ -31,6 +31,13 @@ void UToneMapComponent::PostLoad()
 {
 	Super::PostLoad();
 
+	// Migrate the previous checkbox once and clear its serialized legacy value.
+	if (bEnableUnrealLocalExposure && LocalExposureMode == EToneMapLocalExposureMode::Off)
+	{
+		LocalExposureMode = EToneMapLocalExposureMode::Unreal;
+	}
+	bEnableUnrealLocalExposure = false;
+
 	if (!bUseSceneColor && BloomColorMode == EBloomColorMode::SceneColor)
 	{
 		BloomColorMode = EBloomColorMode::Tint;
@@ -419,6 +426,8 @@ bool UToneMapComponent::SavePresetToPath(const FString& FilePath) const
 		if (!Prop) continue;
 
 		const FString PropName = Prop->GetName();
+		// New presets use the selector; the legacy checkbox is still accepted on load.
+		if (PropName == TEXT("bEnableUnrealLocalExposure")) continue;
 
 		// Skip internal / engine properties
 		if (GPresetSkipProperties.Contains(PropName)) continue;
@@ -472,6 +481,8 @@ bool UToneMapComponent::LoadPresetFromPath(const FString& FilePath)
 
 	int32 Applied = 0;
 	int32 Skipped = 0;
+	bool bImportedLocalExposureMode = false;
+	bool bImportedLegacyLocalExposure = false;
 
 	for (const FString& Line : Lines)
 	{
@@ -513,6 +524,8 @@ bool UToneMapComponent::LoadPresetFromPath(const FString& FilePath)
 		if (Prop->ImportText_Direct(Buffer, ValuePtr, this, PPF_None))
 		{
 			Applied++;
+			bImportedLocalExposureMode |= Key == TEXT("LocalExposureMode");
+			bImportedLegacyLocalExposure |= Key == TEXT("bEnableUnrealLocalExposure");
 		}
 		else
 		{
@@ -523,6 +536,11 @@ bool UToneMapComponent::LoadPresetFromPath(const FString& FilePath)
 
 	UE_LOG(LogTemp, Log, TEXT("ToneMapFX: Preset loaded ← %s (%d applied, %d skipped)"), *FilePath, Applied, Skipped);
 
+	if (bImportedLegacyLocalExposure && !bImportedLocalExposureMode)
+	{
+		LocalExposureMode = bEnableUnrealLocalExposure ? EToneMapLocalExposureMode::Unreal : EToneMapLocalExposureMode::Off;
+	}
+	bEnableUnrealLocalExposure = false;
 	RebuildCustomToneCurveTexture();
 
 #if WITH_EDITOR

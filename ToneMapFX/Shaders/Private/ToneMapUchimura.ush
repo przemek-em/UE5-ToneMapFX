@@ -1,0 +1,58 @@
+// Licensed under the zlib License. See LICENSE file in the project root.
+// Independent HLSL implementation of Hajime Uchimura's classic GT Sport
+// tonemapping curve, presented by Polyphony Digital at CEDEC 2017 and SIGGRAPH
+// Asia 2018. This is the six-parameter scalar curve, not the later GT7
+// color-volume mapper.
+// https://www.polyphony.co.jp/publications/sa2018/
+// Formula cross-checked against dmnsgn/glsl-tone-map (MIT); see
+// ThirdPartyNotices/GLSL-Tone-Map.txt.
+
+#ifndef TONEMAPFX_UCHIMURA_USH
+#define TONEMAPFX_UCHIMURA_USH
+
+// curveParams: x=P (output peak), y=a (contrast), z=m (linear start),
+// w=l (linear length). toeParams: x=c (black tightness), y=b (pedestal).
+float ToneMapFXUchimuraCurve(float value, float4 curveParams, float2 toeParams)
+{
+	float x = max(value, 0.0);
+	float P = max(curveParams.x, 0.1);
+	float a = max(curveParams.y, 0.05);
+	float m = clamp(curveParams.z, 0.001, P - 0.001);
+	float l = clamp(curveParams.w, 0.0, 0.99);
+	float c = max(toeParams.x, 0.1);
+	float b = clamp(toeParams.y, 0.0, m * 0.99);
+
+	float linearRun = (P - m) * l;
+	float shoulderStartX = m + linearRun / a;
+	float shoulderStartY = m + linearRun;
+	float shoulderExponent = -a / max(P - shoulderStartY, 1e-6);
+
+	float toeWeight = 1.0 - smoothstep(0.0, m, x);
+	float shoulderWeight = step(shoulderStartX, x);
+	float linearWeight = max(1.0 - toeWeight - shoulderWeight, 0.0);
+
+	// Clamp inactive branch inputs so eager shader evaluation cannot create
+	// Inf * 0 at extreme scene-linear values.
+	float toe = m * pow(saturate(x / m), c) + b;
+	float linearSection = m + a * (x - m);
+	float shoulderX = max(x, shoulderStartX);
+	float shoulder = P - (P - shoulderStartY) *
+		exp(shoulderExponent * (shoulderX - shoulderStartX));
+
+	return clamp(toe * toeWeight + linearSection * linearWeight + shoulder * shoulderWeight, 0.0, P);
+}
+
+float3 ToneMapFXUchimuraToneMap(
+	float3 workingColor,
+	float3x3 workingToRec709,
+	float4 curveParams,
+	float2 toeParams)
+{
+	float3 rec709 = max(mul(workingToRec709, max(workingColor, 0.0)), 0.0);
+	return float3(
+		ToneMapFXUchimuraCurve(rec709.r, curveParams, toeParams),
+		ToneMapFXUchimuraCurve(rec709.g, curveParams, toeParams),
+		ToneMapFXUchimuraCurve(rec709.b, curveParams, toeParams));
+}
+
+#endif

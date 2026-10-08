@@ -122,7 +122,9 @@ enum class EToneMapFilmCurve : uint8
 	ACESNarkowicz   UMETA(DisplayName = "ACES Narkowicz Fit",
 		ToolTip = "Krzysztof Narkowicz ACES filmic approximation Fast high-contrast filmic curve."),
 	CustomLuminanceCurve UMETA(DisplayName = "Custom Curve (Luminance)",
-		ToolTip = "Samples a CurveFloat across the configured EV range and applies it to scene luminance while preserving color ratios.")
+		ToolTip = "Samples a CurveFloat across the configured EV range and applies it to scene luminance while preserving color ratios."),
+	GTUchimuraClassic UMETA(DisplayName = "GT / Uchimura (Classic)",
+		ToolTip = "Hajime Uchimura's classic six-parameter GT Sport curve. Applied per RGB channel, as presented by Polyphony Digital in 2017/2018.")
 };
 
 /** Creative look applied after the AgX base rendering */
@@ -151,6 +153,18 @@ enum class EToneMapAutoExposure : uint8
 		ToolTip = "Uses Unreal Engine's built-in eye adaptation (histogram or basic). UE's exposure system remains active."),
 	Krawczyk        UMETA(DisplayName = "Krawczyk (Automatic Scene Key)",
 		ToolTip = "(EXPERIMENTAL) Krawczyk et al. 2005: automatic scene key estimation from log-average luminance. UE's built-in exposure is disabled automatically.")
+};
+
+/** Local exposure source. Custom methods run before the selected global film curve. */
+UENUM(BlueprintType)
+enum class EToneMapLocalExposureMode : uint8
+{
+	Off UMETA(DisplayName = "Off",
+		ToolTip = "Disable local exposure. Global/manual exposure remains available."),
+	Unreal UMETA(DisplayName = "Unreal (Post Process Volume)",
+		ToolTip = "Use the standard Post Process Volume local exposure settings, including Bilateral or Exposure Fusion."),
+	Durand UMETA(DisplayName = "Durand (Prototype)",
+		ToolTip = "Full-resolution edge-aware base/detail exposure correction before the selected film curve. Requires Replace Tonemapper and a film curve other than Durand or Fattal. Spatial prototype without temporal history.")
 };
 
 /** Processing path: how color grading operations are evaluated */
@@ -861,6 +875,43 @@ public:
 	UPROPERTY(Transient)
 	TObjectPtr<UTexture2D> CustomToneCurveTexture = nullptr;
 
+	/** Maximum output brightness relative to paper white. Values above 1.0 require True HDR and are capped to available display headroom. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|GT Uchimura Classic",
+		meta=(ClampMin = "0.1", ClampMax = "16.0", UIMin = "0.5", UIMax = "5.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::GTUchimuraClassic"))
+	float UchimuraMaxBrightness = 1.0f;
+
+	/** Slope of the straight middle section. 1.0 is the original neutral-contrast default. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|GT Uchimura Classic",
+		meta=(ClampMin = "0.05", ClampMax = "4.0", UIMin = "0.25", UIMax = "2.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::GTUchimuraClassic"))
+	float UchimuraContrast = 1.0f;
+
+	/** Input value where the straight middle section begins. Runtime validation keeps it below Max Brightness. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|GT Uchimura Classic",
+		meta=(ClampMin = "0.001", ClampMax = "16.0", UIMin = "0.01", UIMax = "1.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::GTUchimuraClassic"))
+	float UchimuraLinearStart = 0.22f;
+
+	/** Fraction of the output range occupied by the straight section before the shoulder. Must remain below 1.0. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|GT Uchimura Classic",
+		meta=(ClampMin = "0.0", ClampMax = "0.99", UIMin = "0.0", UIMax = "0.99",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::GTUchimuraClassic"))
+	float UchimuraLinearLength = 0.4f;
+
+	/** Toe power controlling black tightness. Higher values make the deepest shadows tighter. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|GT Uchimura Classic",
+		meta=(ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "3.0",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::GTUchimuraClassic"))
+	float UchimuraBlackTightness = 1.33f;
+
+	/** Raises the black floor. Runtime validation keeps it below Linear Start to avoid an inverted toe. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve|GT Uchimura Classic",
+		meta=(ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.1",
+		      EditCondition = "Mode == EToneMapMode::ReplaceTonemap && FilmCurve == EToneMapFilmCurve::GTUchimuraClassic",
+		      AdvancedDisplay))
+	float UchimuraPedestal = 0.0f;
+
 	/** HDR color grading saturation (applied pre-curve in linear HDR).
 	    1.0 = neutral (default). 0 = monochrome. 2 = boosted. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Film Curve",
@@ -1340,6 +1391,79 @@ public:
 	 *  Useful for clean ToneMapFX evaluation without temporal smearing. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Engine Overrides")
 	bool bDisableUnrealMotionBlur = false;
+
+	// =========================================================================
+	// Local Exposure
+	// =========================================================================
+
+	/** Choose no local exposure, the standard Unreal volume settings, or the custom Durand prototype.
+	 *  Custom exposure requires Replace Tonemapper with a non-spatial film curve. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure",
+		meta=(DisplayName = "Local Exposure Method"))
+	EToneMapLocalExposureMode LocalExposureMode = EToneMapLocalExposureMode::Off;
+
+	/** Blend the bounded local adjustment in stops. Zero bypasses the custom passes. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Strength", ClampMin = "0.0", ClampMax = "1.0",
+		      UIMin = "0.0", UIMax = "1.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureStrength = 1.0f;
+
+	/** Spatial sigma at full viewport resolution. Sampling support is capped at 32 pixels per axis. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Spatial Sigma (Pixels)", ClampMin = "1.0", ClampMax = "32.0",
+		      UIMin = "1.0", UIMax = "32.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureSpatialSigma = 16.0f;
+
+	/** Range sigma in log2 stops. Smaller values stop smoothing more strongly at luminance edges. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Edge Range (Stops)", ClampMin = "0.05", ClampMax = "8.0",
+		      UIMin = "0.05", UIMax = "4.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureRangeSigmaEV = 1.16f;
+
+	/** Base-layer contrast above middle gray. One is neutral; lower values darken bright regions. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Highlight Contrast", ClampMin = "0.0", ClampMax = "1.0",
+		      UIMin = "0.0", UIMax = "1.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureHighlightContrast = 0.85f;
+
+	/** Base-layer contrast below middle gray. One is neutral; lower values lift dark regions. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Shadow Contrast", ClampMin = "0.0", ClampMax = "1.0",
+		      UIMin = "0.0", UIMax = "1.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureShadowContrast = 0.85f;
+
+	/** Maximum positive local exposure adjustment before Strength. Zero disables lifting. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Maximum Shadow Lift (Stops)", ClampMin = "0.0", ClampMax = "8.0",
+		      UIMin = "0.0", UIMax = "4.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureMaxLiftEV = 1.0f;
+
+	/** Maximum negative local exposure adjustment before Strength. Zero disables darkening. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Maximum Highlight Darkening (Stops)", ClampMin = "0.0", ClampMax = "8.0",
+		      UIMin = "0.0", UIMax = "4.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureMaxDarkenEV = 1.0f;
+
+	/** Protect this interval on either side of middle gray, with a smooth one-stop onset outside it. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Midtone Protection (Stops)", ClampMin = "0.0", ClampMax = "4.0",
+		      UIMin = "0.0", UIMax = "4.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureMidtoneProtectionEV = 1.0f;
+
+	/** Shift the 0.18 middle-gray pivot in stops. Manual plugin exposure is applied afterward. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Middle Grey Bias (Stops)", ClampMin = "-4.0", ClampMax = "4.0",
+		      UIMin = "-4.0", UIMax = "4.0", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	float LocalExposureMiddleGreyBias = 0.0f;
+
+	/** Fade shadow lifting between eight and twelve stops below the middle-gray pivot. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Tone Map|Local Exposure|Durand",
+		meta=(DisplayName = "Protect Deep Shadows", EditCondition = "Mode == EToneMapMode::ReplaceTonemap && LocalExposureMode == EToneMapLocalExposureMode::Durand && FilmCurve != EToneMapFilmCurve::Durand && FilmCurve != EToneMapFilmCurve::Fattal"))
+	bool bLocalExposureProtectDeepShadows = true;
+
+	/** Serialized legacy checkbox retained for older components and text presets. */
+	UPROPERTY()
+	bool bEnableUnrealLocalExposure = false;
 
 	// =========================================================================
 	// Presets (Save / Load to .txt files via OS file dialog)

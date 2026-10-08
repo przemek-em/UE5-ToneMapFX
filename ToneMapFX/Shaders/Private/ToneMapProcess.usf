@@ -14,6 +14,7 @@
 #include "/Engine/Public/Platform.ush"
 #include "/Engine/Private/Common.ush"
 #include "/Engine/Private/ScreenPass.ush"
+#include "/Plugin/ToneMapFX/Private/ToneMapUchimura.ush"
 
 // ============================================================================
 // Shader Parameters (must match FToneMapProcessPS::FParameters exactly)
@@ -45,8 +46,11 @@ float GlobalExposure;
 // Hable Film Curve params (ReplaceTonemap mode)
 float4 HableParams1;   // x=A(Shoulder), y=B(Linear), z=C(LinearAngle), w=D(ToeStrength)
 float4 HableParams2;   // x=E(ToeNum), y=F(ToeDenom), z=W(WhitePoint), w=unused
-float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX, 7=ACESHill, 8=ACESNarkowicz, 9=CustomLuminance
+float  FilmCurveMode;   // 0=Hable, 1=ReinhardLum, 2=ReinhardJodie, 3=ReinhardStd, 4=Durand, 5=Fattal, 6=AgX, 7=ACESHill, 8=ACESNarkowicz, 9=CustomLuminance, 10=GTUchimuraClassic
 float  ReinhardWhitePoint; // Extended Reinhard L_white
+float4 UchimuraParams1; // x=Peak, y=Contrast, z=LinearStart, w=LinearLength
+float2 UchimuraParams2; // x=BlackTightness, y=Pedestal
+float4x4 WorkingToRec709;
 Texture2D    CustomCurveTexture;
 SamplerState CustomCurveSampler;
 float4 CustomCurveParams; // x=MinEV, y=InvEVRange, zw=unused
@@ -894,6 +898,9 @@ float3 ApplyFilmCurve(float3 color, float mode, float4 hableParams1, float4 habl
 		return ACESNarkowiczToneMap(color);                        // 8 = ACES Narkowicz Fit
 	else if (mode < 9.5)
 		return CustomLuminanceToneMap(color);                      // 9 = Custom Luminance Curve
+	else if (mode < 10.5)
+		return ToneMapFXUchimuraToneMap(
+			color, (float3x3)WorkingToRec709, UchimuraParams1, UchimuraParams2);
 	else
 		return ReinhardStandard(color, reinhardWP);                // fallback
 }
