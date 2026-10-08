@@ -145,7 +145,6 @@ To lift shadows, select **Durand (Prototype)** with a global curve such as Uchim
 
 The custom filter works at full resolution against the original luminance guide, without mixing in a Gaussian base or reconstructing a lower-resolution result. It uses four fullscreen passes plus exposure setup. This is a spatial prototype: GPU timings and temporal behavior still need evaluation; guided filtering, temporal stabilization, and custom exposure fusion remain proposed extensions.
 
-See the [prototype guide](Docs/LocalExposurePrototype.md) for comparison settings and implementation details, and the [research/design note](Docs/CustomLocalExposureResearch.md) for references and future options.
 
 ### Bloom
 Five bloom styles:
