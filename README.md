@@ -90,21 +90,6 @@ Multiple ToneMapFX actors/components can blend together in the same level.
 - **GT / Uchimura (Classic)** - Hajime Uchimura's six-parameter GT Sport curve, with a toe, straight middle section, and smooth highlight shoulder. Applied per RGB channel after conversion from the project's working color space to Rec.709. Available in both Per-Pixel and LUT processing paths.
 - **HDR Saturation & Color Balance** - Pre-curve adjustments in linear HDR
 
-#### GT / Uchimura Controls
-
-Select **Replace Tonemapper** and **GT / Uchimura (Classic)**, then open **Tone Map > Film Curve > GT Uchimura Classic**.
-
-| Control | Default | Effect |
-|---------|---------|--------|
-| Max Brightness | 1.0 | Output peak relative to paper white; values above 1 require True HDR Output and are capped to display headroom. |
-| Contrast | 1.0 | Slope of the straight middle section. |
-| Linear Start | 0.22 | Input value where the straight section starts. |
-| Linear Length | 0.4 | Fraction of the output range used by the straight section before the shoulder. |
-| Black Tightness | 1.33 | Toe power; higher values tighten the deepest shadows. |
-| Pedestal (Advanced) | 0.0 | Raises the black floor. |
-
-Parameters are validated together to keep the curve stable, including keeping Linear Start below Max Brightness and Pedestal below Linear Start. The release implementation uses the same curve and defaults as the testing plugin. See the [Uchimura reference notice](ThirdPartyNotices/GLSL-Tone-Map.txt).
-
 ### Auto-Exposure *(Replace Tonemapper Mode)*
 - **Manual (None)** - No automatic exposure. UE's built-in exposure is disabled automatically; only the manual Exposure slider applies.
 - **Engine Default** - UE's built-in eye adaptation remains active and passes exposure through.
