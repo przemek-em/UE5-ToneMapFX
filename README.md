@@ -276,6 +276,7 @@ Physical camera model - **ISO**, **Shutter Speed Denominator** (1/X notation), *
 - [x] ~~GT / Uchimura classic tone mapper~~ *(done — six controls, Per-Pixel/LUT integration, HDR-aware output peak)*
 - [x] ~~Selectable local exposure~~ *(done — Off by default, Unreal Post Process Volume integration, and custom Durand prototype)*
 - [ ] Custom local exposure: GPU profiling, temporal stabilization, and evaluation of guided filtering / exposure fusion
+- [ ] "Apply filters after tonemap or before tonemap" modes (after tonemap can produce "cry-engine" like postprocessing, for my opinion better solution where you can achieve more vivid-like results)
 - [ ] LUT export
 - [ ] Additional RGB curves
 - [ ] Texture overlay
